@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
 # Acceptance checks for omp-structured, run against REAL omp config/auth and
-# REAL backends (vLLM always; Anthropic when reachable). No stand-ins, no
-# mocks — every check below is a live subprocess invocation of dist/cli.js.
+# REAL backends (vLLM always; Anthropic when reachable) plus the pure-function
+# unit tests for every api family with no live credentials here. No stand-ins,
+# no mocks in (a)-(d) — every one of those is a live subprocess invocation of
+# dist/cli.js against a real backend.
 #
 # Reports each check's pass/fail plainly, including the large-schema
 # reliability check as an explicit N/5 count and, for each of the 5 runs, how
 # many needed the one-shot session-read continuation (src/session-recovery.ts)
 # now that the bounded retry loop is gone. Exits non-zero if any REQUIRED
-# check (a, b, d) fails; the Anthropic check (c) is best-effort and reported
-# separately since it depends on network/auth reachability outside this repo.
+# check (a, b, d, e) fails; the Anthropic check (c) is best-effort and
+# reported separately since it depends on network/auth reachability outside
+# this repo.
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -148,10 +151,21 @@ fi
 echo
 
 echo "================================================================"
+echo "(e) per-api unit tests for every api family with no live credentials here (pure functions, no network)"
+echo "================================================================"
+if bun test src 2>&1 | tee /tmp/omp-structured-e.out; then
+  echo "RESULT: PASS (all payload-injection.test.ts cases passed)"
+else
+  echo "RESULT: FAIL"
+  overall_pass=false
+fi
+echo
+
+echo "================================================================"
 echo "SUMMARY"
 echo "================================================================"
 if $overall_pass; then
-  echo "All required checks (a, b, d) passed. See above for (c)."
+  echo "All required checks (a, b, d, e) passed. See above for (c)."
   exit 0
 else
   echo "At least one required check FAILED. See above."

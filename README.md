@@ -3,11 +3,13 @@
 A headless TypeScript CLI that drives the real, published **omp SDK**
 (`@oh-my-pi/pi-coding-agent` + `@oh-my-pi/pi-ai`, pinned to `18.2.8`) to run
 **one completion constrained to a caller-supplied JSON Schema via genuine
-constrained decoding** — vLLM/OpenAI `response_format`, Anthropic
-`output_config.format` — inheriting config, auth, and model resolution from
-`~/.omp` exactly as `omp` itself does. It is a subprocess entry point: give it
-a provider/model, a JSON Schema, and a prompt; it prints one schema-valid JSON
-object to stdout and exits 0, or fails loud on stderr.
+constrained decoding**, keyed off the resolved model's exact `api`
+discriminant across every omp api family that has a documented
+structured-output wire field — see "Supported api families" below —
+inheriting config, auth, and model resolution from `~/.omp` exactly as `omp`
+itself does. It is a subprocess entry point: give it a provider/model, a
+JSON Schema, and a prompt; it prints one schema-valid JSON object to stdout
+and exits 0, or fails loud on stderr.
 
 ## Why this exists
 
@@ -49,17 +51,78 @@ This repo is that missing entry point, built directly against the SDK.
 
 **How the constraint actually reaches the wire** (see
 `src/payload-injection.ts`): omp's cross-provider `SimpleStreamOptions` has no
-`response_format`/`output_config` field at all — verified by reading
-`packages/ai/src/types.ts`, `providers/openai-completions.ts`, and
-`providers/anthropic.ts` in the installed `18.2.8` source. The real,
-documented extension point is `onPayload`: "Callback invoked with the
+`response_format`/`output_config`/`generationConfig`/etc. field for ANY api
+family — verified by reading `packages/ai/src/types.ts` and every provider
+file under `packages/ai/src/providers/` in the installed `18.2.8` source. The
+real, documented extension point is `onPayload`: "Callback invoked with the
 provider request payload just before sending. Return a replacement payload
 object... to send it instead of the original" (`packages/ai` README). Every
 built-in provider except `devin-agent` honors it. This CLI's `onPayload`
-merges `response_format` (OpenAI/vLLM chat-completions) or
-`output_config.format` (Anthropic Messages) onto the exact wire body omp was
-about to send — the provider then does real guided decoding. No tool call, no
-`/force`, nothing the model can decline.
+merges the correct provider-native structured-output field onto the exact
+wire body omp was about to send, keyed off `model.api` (see "Supported api
+families" below) — the provider then does real guided decoding. No tool
+call, no `/force`, nothing the model can decline.
+
+## Supported api families
+
+`src/payload-injection.ts` covers every `KnownApi` value
+(`@oh-my-pi/pi-catalog/types.ts`) that has a documented structured-output
+wire field, verified against the installed `@oh-my-pi/pi-ai@18.2.8` provider
+source (file references below) and, where noted, AWS's own Bedrock
+documentation. **Live-verified** means an actual `scripts/acceptance.sh` run
+against a real backend produced schema-valid output (see "Acceptance").
+Every other row is **schema-verified only**: a pure-function unit test in
+`src/payload-injection.test.ts` asserts the exact injected body shape against
+a synthetic payload shaped like the real one, but no live backend/credential
+for that family exists on this machine.
+
+| `model.api` | Wire field injected | Provider source verified against | Status |
+| --- | --- | --- | --- |
+| `openai-completions` | `response_format: {type:"json_schema", json_schema:{name,schema,strict:true}}` | `providers/openai-completions.ts` | **Live-verified** (vLLM) |
+| `anthropic-messages` | `output_config.format: {type:"json_schema", schema}` | `providers/anthropic.ts`, `providers/anthropic-wire.ts` | **Live-verified** (Anthropic) |
+| `openai-responses` | `text.format: {type:"json_schema", name, schema, strict:true}` | `providers/openai-responses.ts`, `providers/openai-responses-wire.ts` | Schema-verified only |
+| `openai-codex-responses` | same as `openai-responses` (identical `ResponseCreateParamsStreaming` wire shape on both its SSE and websocket transports) | `providers/openai-codex-responses.ts` | Schema-verified only |
+| `azure-openai-responses` | same as `openai-responses` (imports the identical wire types) | `providers/azure-openai-responses.ts` | Schema-verified only |
+| `openrouter` | **structurally ambiguous** - `text.format` when the payload carries `input` (Responses wire), `response_format` when it carries `messages` (Completions wire); see below | `stream.ts` (`case "openrouter"`), `providers/openai-responses.ts`, `providers/openai-completions.ts` | Schema-verified only |
+| `google-generative-ai` | `config.{responseMimeType:"application/json", responseJsonSchema:schema}` on the SDK-shaped `GenerateContentParameters` `onPayload` actually receives (lifted onto the literal `generationConfig` wire key afterwards by `paramsToWireBody`) | `providers/google-shared.ts`, `providers/google.ts` | Schema-verified only |
+| `google-vertex` | identical to `google-generative-ai` (shares the same `streamGoogleGenAI`/`buildGoogleGenerateContentParams` code path) | `providers/google-shared.ts`, `providers/google-vertex.ts` | Schema-verified only |
+| `google-gemini-cli` | `request.generationConfig.{responseMimeType:"application/json", responseJsonSchema:schema}` (distinct `{project,model,request:{...}}` `CloudCodeAssistRequest` wire shape) | `providers/google-gemini-cli.ts` | Schema-verified only |
+| `ollama-chat` | top-level `format: schema` (Ollama's own documented structured-output field; omp's own `createChatBody` does not set it at all, so this is the CLI adding a field omp never sends, not overriding one) | `providers/ollama.ts` | Schema-verified only |
+| `bedrock-converse-stream` | `outputConfig.textFormat: {type:"json_schema", structure:{jsonSchema:{name, schema: JSON.stringify(schema)}}}` - `schema` is a **JSON-encoded string** here, unlike every other family, per AWS's own documented Converse-API shape | `providers/amazon-bedrock.ts` (no native structured-output field at all — confirmed by reading `commandInput`'s full type); wire shape confirmed against https://docs.aws.amazon.com/bedrock/latest/userguide/structured-output.html | Schema-verified only |
+| `cursor-agent`, `gitlab-duo-agent`, `devin-agent` | none — throws `UnsupportedApiError` | `providers/cursor.ts`, `providers/gitlab-duo-workflow.ts`, `providers/devin.ts` (agentic/terminal-driving transports, not a JSON completion API) | Not applicable |
+| `mock` (SDK-internal test provider, not a `KnownApi` member) | none — throws `UnsupportedApiError` | `providers/mock.ts` | Not applicable |
+
+Three real corrections to the api list this repo shipped with before this
+change: there is no separate `"openai"`/`"anthropic"` api distinct from
+`"openai-completions"`/`"anthropic-messages"` (`KnownApi` has no such
+values — Kimi, for instance, is a `provider`, not an `api`; it rides
+`openai-completions` via `providers/kimi.ts`'s
+`streamKimi(model: Model<"openai-completions">, ...)`), and there is no
+`"amazon-bedrock"` api — the real value is `"bedrock-converse-stream"`.
+
+**`openrouter`'s wire shape is genuinely ambiguous at the api-discriminant
+level, not just under-documented.** `packages/ai/src/stream.ts` dispatches an
+`openrouter` model to either `streamOpenAIResponses` or
+`streamOpenAICompletions` depending on `$env.PI_OPENROUTER_RESPONSES`
+(default: Responses), via `providerModel as Model<"openai-responses">` — a
+**TypeScript-only** cast (`castApi = (api) => api as OptionsForApi<Api>`).
+The object `onPayload` actually receives at runtime still has
+`model.api === "openrouter"` literally, in both branches — verified by
+reading `castApi`'s implementation, not inferred. So `model.api` cannot
+distinguish the two wire shapes; `src/payload-injection.ts`'s `openrouter`
+injector instead detects the shape structurally from the payload's own keys
+(`input` only exists on the Responses wire, `messages` only on the
+Completions wire), and both branches are unit-tested.
+
+Every one of the schema-verified-only rows above is implemented against the
+real wire types/functions cited in its "Provider source verified against"
+column, read directly from the installed `18.2.8` source
+(`node_modules/@oh-my-pi/pi-ai/src/providers/*.ts`) — none are guesses from
+the providers' public API docs alone, except `bedrock-converse-stream` (omp's
+own Bedrock provider has no structured-output field of its own to read;
+the wire shape there is AWS's documented one, cross-checked against the
+`outputConfig`/`toolConfig`/`guardrailConfig` sibling fields omp's own
+`ConverseStreamRequest` type already carries).
 
 ## Known local-model reliability note
 
@@ -222,7 +285,9 @@ bump implicitly via `npm update`.
 ## Acceptance
 
 `scripts/acceptance.sh` runs every check against real omp config/auth and
-real backends — no recording stand-ins, no mocks:
+real backends — no recording stand-ins, no mocks for (a)-(d); (e) is the
+pure-function unit-test suite for every api family with no live credentials
+on this machine (see "Supported api families" above):
 
 - (a) trivial 2-field schema vs `vllm/qwen3.8-27b-ablit`
 - (b) the real ~22KB `exophial.ops.typed_intake.proposal_or_escalate_schema()`
@@ -235,6 +300,8 @@ real backends — no recording stand-ins, no mocks:
 - (d) `--session` produces a real session `.jsonl` under
   `~/.omp/agent/sessions/<cwd-slug>/` whose header `id` matches the reported
   session id
+- (e) `bun test src` - `src/payload-injection.test.ts`'s per-api wire-shape
+  assertions
 
 ```bash
 npm run acceptance
@@ -247,6 +314,7 @@ A real run against this machine's vLLM + Anthropic (2026-09-21) produced:
 (b) 5/5 schema-valid; 5/5 needed the one-shot session-read continuation
 (c) PASS (exit 0, schema-valid object)
 (d) PASS (file exists on disk, header id matches reported id)
+(e) 17 pass, 0 fail (23 expect() calls)
 ```
 
 ## Exophial integration (exo-3904 / exo-c441 fix path)

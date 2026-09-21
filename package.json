@@ -1,7 +1,7 @@
 {
   "name": "omp-structured",
   "version": "1.0.0",
-  "description": "Headless CLI: one omp-SDK completion constrained to a JSON Schema via real constrained decoding (vLLM response_format / Anthropic output_config.format), inheriting config/auth from ~/.omp.",
+  "description": "Headless CLI: one omp-SDK completion constrained to a JSON Schema via real constrained decoding across every omp api family that supports it, inheriting config/auth from ~/.omp.",
   "type": "module",
   "bin": {
     "omp-structured": "dist/cli.js"
@@ -11,6 +11,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && chmod +x dist/cli.js",
+    "test": "bun test src",
     "acceptance": "bash scripts/acceptance.sh"
   },
   "repository": {
