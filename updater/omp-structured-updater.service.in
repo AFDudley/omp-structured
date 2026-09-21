@@ -1,0 +1,11 @@
+[Unit]
+Description=Auto-update omp-structured against the upstream oh-my-pi SDK
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# @BIN@ is substituted by install.sh with the absolute install directory.
+ExecStart=@BIN@/run.sh
+# A poll cycle clones/builds/tests; give it room but never hang forever.
+TimeoutStartSec=60min

@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll upstream oh-my-pi SDK for omp-structured updates
+
+[Timer]
+# First poll shortly after the timer starts, then once a day; Persistent catches missed runs.
+OnActiveSec=2min
+OnUnitActiveSec=1d
+Persistent=true
+
+[Install]
+WantedBy=timers.target
