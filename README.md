@@ -18,7 +18,8 @@ schema) and forces it via omp's `/force:respond` builtin. Two real,
 independently-filed defects show this is the wrong mechanism:
 
 - **exo-3904** (open): with the ~22KB `proposal_or_escalate_schema()` from
-  `exophial.ops.derivation_schema`, both `claude-opus-4-8` and
+  `exophial.ops.typed_intake` (equivalently `exophial.ops.derivation_schema`,
+  which re-derives the identical schema), both `claude-opus-4-8` and
   `claude-sonnet-5` intermittently **end their turn without ever calling the
   `respond` tool** — 120+ seconds of a forced tool choice, then nothing.
   `OmpTransport` raises `TransportError: ended its turn without calling the
@@ -65,29 +66,98 @@ about to send — the provider then does real guided decoding. No tool call, no
 The local `vllm/qwen3.8-27b-ablit` server is a hybrid-reasoning model, and
 independent of constrained decoding it sometimes ends its turn (a clean
 `stopReason: "stop"`) **entirely inside its own `<think>` segment**, emitting
-no final-answer text at all. Measured directly against the raw SDK (no CLI, no
-retry): trivial schema 2-3/8 turns produced text; large schema similarly
-inconsistent. This reproduces identically with `response_format` entirely
-absent, so it is a pre-existing model/template termination trait, not
-something constrained decoding introduces — and every turn that *does* leave
-its reasoning segment has produced schema-valid JSON, 100% of the time, across
-every trial run in this repo's history.
+no final-answer text at all. This reproduces identically with
+`response_format` entirely absent, so it is a pre-existing model/template
+termination trait, not something constrained decoding introduces — and every
+turn that *does* leave its reasoning segment has produced schema-valid JSON,
+100% of the time, across every trial run in this repo's history.
 
-Two mitigations, both implemented and both honest (neither hides the
-underlying behavior, both are visible on stderr):
+`reasoning: Effort.Medium` instead of omp's ambient `"low"` default for this
+model (see `src/cli.ts`) measurably reduces how often this happens, but does
+not eliminate it — so this repo does not pretend a reasoning-effort tweak is
+a fix. See "One-shot session-read recovery" below for the actual mechanism.
 
-1. `reasoning: Effort.Medium` instead of omp's ambient `"low"` default for
-   this model — measurably fewer answerless stops.
-2. A bounded retry (`src/answer-retry.ts`, up to `ANSWER_RETRY_MAX_ATTEMPTS =
-   20`, light backoff since the target is a local server) for exactly the
-   "clean stop, zero text content" case — the sibling of omp's own
-   `resolveWithThinkingLoopRetries` guard (`packages/ai/src/stream.ts`), which
-   only covers the narrower `stopReason: "error"` empty-content stall and does
-   not catch this `"stop"` variant.
+## One-shot session-read recovery
 
-With both in place, `scripts/acceptance.sh`'s 5-run large-schema check passed
-5/5 (see below). Retries are logged to stderr; if you see them, that is this
-model behaving as measured above, not the JSON Schema constraint failing.
+**A bounded retry loop is forbidden here.** Regenerating the whole completion
+from scratch on an answerless stop throws away real, completed reasoning
+work and replaces it with a fresh, independent dice roll on the exact same
+failure mode — neither deterministic nor a fix, just cost. `src/cli.ts`
+issues at most one extra completion, ever, for this case; there is no retry
+counter, no backoff, no loop.
+
+omp's own guard for a related failure
+(`packages/ai/src/stream.ts`'s `isRetryableThinkingLoop` /
+`resolveWithThinkingLoopRetries`) only covers `stopReason: "error"` with
+empty content — a stalled/errored stream. It does not cover a **well-formed**
+`stopReason: "stop"` that simply never left the reasoning segment; that is
+the case this repo handles, in `src/session-recovery.ts`.
+
+**The mechanism** (`resolveAnswerlessTurnViaSession`), on an answerless
+first turn:
+
+1. **Persist the turn to a real omp session.** `SessionManager.create(cwd)` +
+   `appendMessage(userMessage)` + `appendMessage(answerlessResult)` +
+   `ensureOnDisk()` — the exact same `SessionManager` API `--session` already
+   uses, writing a real `.jsonl` under `~/.omp/agent/sessions/<cwd-slug>/`
+   with the model's thinking blocks intact, in whatever provider-specific
+   shape omp itself persists them in.
+2. **Read the persisted session back from disk** through omp's own read-only
+   transcript loader,
+   `@oh-my-pi/pi-coding-agent/session/session-loader`'s
+   `loadSessionMessagesReadOnly(sessionFile)` — the same function a resumed
+   omp session uses to rebuild provider-replayable history. This is the
+   actual "read the persisted session" step: an independent reload from the
+   file just written, not a reuse of the in-memory `AssistantMessage`
+   object. It is one-shot because there is nothing left to compute: the
+   model's reasoning already happened and is already durable on disk: this
+   step only recovers it faithfully, through the same code path a real omp
+   session resume would use, rather than trusting this process's own memory
+   of what it just produced.
+3. **If the persisted turn already carries visible text** (a defensive
+   check only — the case that reached this code already failed that exact
+   test once), use it directly; no continuation is issued.
+4. **Otherwise, issue exactly one continuation turn in the same session**:
+   append one new user message ("Your reasoning above is already complete.
+   Do not reason further and do not call any tools. Output only the single
+   final JSON object that satisfies the required schema now.") to the
+   persisted history and call `completeSimple` once more. The model's own
+   completed reasoning is history at this point, not something it is asked
+   to redo — it only has to serialize what it already determined.
+5. The continuation's `AssistantMessage` is also appended to the same
+   session and flushed. If it *also* comes back answerless, `src/cli.ts`
+   fails loudly (exit 4) — no further attempts are made, by design.
+
+**A measured, real gap that needed a real fix, not just the mechanism above:**
+`completionOptions.disableReasoning: true` alone was measured to be
+**insufficient** to stop the continuation from re-entering `<think>` — live
+testing against real vLLM caught `openai-completions.ts`'s own
+provider-session reasoning-effort state still stamping a concrete wire
+effort (`chat_template_kwargs: {enable_thinking: true, reasoning_effort:
+"low"}`) onto the continuation request even with `options.reasoning ===
+undefined` and `options.disableReasoning === true`. `onPayload` runs strictly
+after all of that internal policy resolution, immediately before the request
+is sent, so `src/session-recovery.ts`'s `forceReasoningOffOnWire` uses it as
+the unconditional last-mile guarantee: it flips every reasoning/thinking
+toggle omp's own policy resolution already populated on the wire body
+(`enable_thinking`, `chat_template_kwargs.enable_thinking`,
+`reasoning_effort`, `thinking`) to off, composed after the schema-constraint
+`onPayload` from `payload-injection.ts` on the continuation call only. It
+only flips fields already present on the wire body — it never adds an
+unknown top-level key a strict-schema server (e.g. NVIDIA NIM) might reject.
+
+`--session` is not required to trigger this mechanism: when the caller did
+not pass `--session`, the session file this mechanism creates internally is
+deleted (`fs.unlink`) once the run resolves, on both the success and the
+eventual-failure path, so a `--no-session` (default) invocation leaves the
+same zero-artifact footprint as before, whether or not recovery fired. When
+the caller *did* pass `--session`, the recovery's session IS the one printed
+via `--print-session-id` - the continuation, if any, is part of the same
+session's history, not a second session.
+
+With this in place, `scripts/acceptance.sh`'s 5-run large-schema check
+passed 5/5 against real vLLM, with 5/5 of those runs needing the one-shot
+continuation (see "Acceptance" below for the verbatim run).
 
 ## Usage
 
@@ -155,10 +225,11 @@ bump implicitly via `npm update`.
 real backends — no recording stand-ins, no mocks:
 
 - (a) trivial 2-field schema vs `vllm/qwen3.8-27b-ablit`
-- (b) the real ~22KB `exophial.ops.derivation_schema.proposal_or_escalate_schema()`
+- (b) the real ~22KB `exophial.ops.typed_intake.proposal_or_escalate_schema()`
   (imported live via `uv run`; falls back to a synthesized comparable-depth
   schema if exophial isn't importable) vs `vllm/qwen3.8-27b-ablit`, run 5
-  times, reporting N/5
+  times, reporting N/5 schema-valid AND how many of the 5 needed the
+  one-shot session-read continuation
 - (c) trivial schema vs `anthropic/claude-sonnet-5` (best-effort; depends on
   the auth broker being reachable)
 - (d) `--session` produces a real session `.jsonl` under
@@ -167,6 +238,15 @@ real backends — no recording stand-ins, no mocks:
 
 ```bash
 npm run acceptance
+```
+
+A real run against this machine's vLLM + Anthropic (2026-09-21) produced:
+
+```
+(a) PASS (exit 0, schema-valid object)
+(b) 5/5 schema-valid; 5/5 needed the one-shot session-read continuation
+(c) PASS (exit 0, schema-valid object)
+(d) PASS (file exists on disk, header id matches reported id)
 ```
 
 ## Exophial integration (exo-3904 / exo-c441 fix path)

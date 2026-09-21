@@ -3,11 +3,13 @@
  * omp-structured: a headless CLI that drives the real omp SDK
  * (@oh-my-pi/pi-coding-agent + @oh-my-pi/pi-ai) to run ONE completion
  * constrained to a caller-supplied JSON Schema via genuine constrained
- * decoding (OpenAI/vLLM `response_format`, Anthropic `output_config.format`),
- * inheriting config/auth from ~/.omp exactly as `omp` itself does.
+ * decoding, inheriting config/auth from ~/.omp exactly as `omp` itself does.
  *
- * See README.md for the design rationale (exo-3904 / exo-c441) and
- * src/payload-injection.ts for exactly how each API family is constrained.
+ * See README.md for the design rationale (exo-3904 / exo-c441),
+ * src/payload-injection.ts for exactly how each api family is constrained,
+ * and src/session-recovery.ts for the one-shot session-read recovery this
+ * file drives when a reasoning model ends its turn without ever leaving its
+ * own `<think>` segment.
  *
  * Profile handling: omp resolves `OMP_PROFILE` at MODULE LOAD time in
  * @oh-my-pi/pi-utils/dirs (before any of our code runs), so `--profile` must
@@ -18,17 +20,34 @@
  * and observe the wrong profile). `@oh-my-pi/pi-catalog/effort` below is a
  * pure, side-effect-free constant module and stays a static import.
  */
+import * as fs from "node:fs/promises";
 import { default as Ajv } from "ajv";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
-import type { AssistantMessage, Context, UserMessage } from "@oh-my-pi/pi-ai/types";
-import { ANSWER_RETRY_MAX_ATTEMPTS, answerRetryDelayMs, isAnswerlessStop, sleep } from "./answer-retry.js";
+import type { AssistantMessage, Context, Message, UserMessage } from "@oh-my-pi/pi-ai/types";
 import { CliArgError, type CliArgs, parseArgs } from "./args.js";
 import { isStdinRequested, readPathOrStdin } from "./io.js";
 import { buildConstrainedOnPayload, type ConstrainedOnPayload, type JsonSchema, UnsupportedApiError } from "./payload-injection.js";
+import { isAnswerlessStop, resolveAnswerlessTurnViaSession, type SessionManagerHandle } from "./session-recovery.js";
 
 function fail(message: string, exitCode: number): never {
   process.stderr.write(`${message}\n`);
   process.exit(exitCode);
+}
+
+/**
+ * Deletes the on-disk session file the one-shot recovery mechanism creates
+ * internally when the caller did not pass `--session` - `fail()` calls
+ * `process.exit()` directly, so it never reaches the natural cleanup at the
+ * bottom of `main()`; every failure path reachable after
+ * `resolveAnswerlessTurnViaSession` may have created one and MUST call this
+ * first so a run that ultimately fails leaves no artifact, matching the
+ * no-`--session` contract on the success path.
+ */
+async function cleanupEphemeralSession(sessionManager: SessionManagerHandle | undefined, keep: boolean): Promise<void> {
+  if (!sessionManager || keep) return;
+  await sessionManager.close().catch(() => undefined);
+  const sessionFile = sessionManager.getSessionFile();
+  if (sessionFile) await fs.unlink(sessionFile).catch(() => undefined);
 }
 
 async function readSchemaAndPrompt(args: CliArgs): Promise<{ schema: JsonSchema; promptText: string }> {
@@ -109,49 +128,82 @@ async function main(): Promise<void> {
     () => controller.abort(new Error(`timed out after ${args.timeoutSeconds}s`)),
     args.timeoutSeconds * 1000,
   );
+
+  // Populated only when the one-shot recovery path (below) or `--session`
+  // needs a real on-disk session; the common (has-text-on-the-first-turn)
+  // path never touches SessionManager at all.
+  let sessionManager: SessionManagerHandle | undefined;
   let result: AssistantMessage | undefined;
   try {
-    for (let attempt = 0; attempt < ANSWER_RETRY_MAX_ATTEMPTS; attempt++) {
-      const attemptResult = await completeSimple(model, context, {
-        apiKey,
-        maxTokens: 4096,
-        signal: controller.signal,
-        // "medium" measurably reduces answerless reasoning-only stops versus
-        // omp's ambient "low" default for this local model (see README
-        // "Known local-model reliability note"); only reasoning-capable
-        // models accept a `reasoning` option at all.
-        reasoning: model.reasoning ? Effort.Medium : undefined,
-        onPayload,
-      });
-      if (!isAnswerlessStop(attemptResult)) {
-        result = attemptResult;
-        break;
-      }
-      result = attemptResult;
+    const completionOptions: Record<string, unknown> = {
+      apiKey,
+      maxTokens: 4096,
+      signal: controller.signal,
+      // "medium" measurably reduces answerless reasoning-only stops versus
+      // omp's ambient "low" default for this local model (see README
+      // "Known local-model reliability note"); only reasoning-capable
+      // models accept a `reasoning` option at all.
+      reasoning: model.reasoning ? Effort.Medium : undefined,
+      onPayload,
+    };
+    result = await completeSimple(model, context, completionOptions);
+
+    if (isAnswerlessStop(result)) {
       process.stderr.write(
-        `[omp-structured] attempt ${attempt + 1}/${ANSWER_RETRY_MAX_ATTEMPTS} ended inside the model's reasoning with no answer text; retrying (see README "Known local-model reliability note")\n`,
+        "[omp-structured] turn ended entirely inside the model's reasoning with no answer text; " +
+          'resolving via one-shot session read (see README "One-shot session-read recovery")\n',
       );
-      if (attempt + 1 < ANSWER_RETRY_MAX_ATTEMPTS) {
-        await sleep(answerRetryDelayMs(attempt));
+      // Deferred: same OMP_PROFILE-ordering constraint as the top-of-main
+      // batch (file header), and this branch only runs on the answerless-
+      // stop path, so a static import would load session-manager's/
+      // session-loader's dependency graph on every invocation instead of
+      // only the ones that actually hit this recovery mechanism.
+      const [{ SessionManager }, { loadSessionMessagesReadOnly }] = await Promise.all([
+        import("@oh-my-pi/pi-coding-agent/session/session-manager"),
+        import("@oh-my-pi/pi-coding-agent/session/session-loader"),
+      ]);
+      sessionManager = SessionManager.create(args.cwd);
+      const recovery = await resolveAnswerlessTurnViaSession(sessionManager, userMessage, result, model, completionOptions, {
+        loadSessionMessagesReadOnly: filePath => loadSessionMessagesReadOnly(filePath) as unknown as Promise<Message[]>,
+        completeSimple,
+      });
+      result = recovery.result;
+      if (!recovery.continuationIssued) {
+        process.stderr.write("[omp-structured] persisted session already carried answer text; no continuation turn was needed\n");
+      } else if (isAnswerlessStop(result)) {
+        process.stderr.write(
+          "[omp-structured] one-shot continuation turn also ended inside the model's reasoning with no answer text; no further attempts will be made\n",
+        );
+      } else {
+        process.stderr.write("[omp-structured] one-shot continuation turn (seeded from the persisted reasoning) produced answer text\n");
       }
     }
   } catch (err) {
+    await cleanupEphemeralSession(sessionManager, args.session);
     fail(`Completion request failed: ${err instanceof Error ? err.message : String(err)}`, 4);
   } finally {
     clearTimeout(timer);
   }
-  if (!result) fail("Completion request produced no result.", 4);
+
+  if (!result) {
+    await cleanupEphemeralSession(sessionManager, args.session);
+    fail("Completion request produced no result.", 4);
+  }
   if (isAnswerlessStop(result)) {
+    await cleanupEphemeralSession(sessionManager, args.session);
     fail(
-      `Model ended its turn without producing answer text ${ANSWER_RETRY_MAX_ATTEMPTS} times in a row (reasoning-only stop each time).`,
+      "Model ended its turn without producing answer text on both the original turn and the one-shot " +
+        "session-read continuation (reasoning-only stop both times). No further attempts are made.",
       4,
     );
   }
 
   if (result.errorMessage) {
+    await cleanupEphemeralSession(sessionManager, args.session);
     fail(`Model returned an error (stopReason=${result.stopReason}): ${result.errorMessage}`, 4);
   }
   if (result.stopReason !== "stop") {
+    await cleanupEphemeralSession(sessionManager, args.session);
     fail(`Model did not finish normally (stopReason=${result.stopReason}).`, 4);
   }
 
@@ -159,6 +211,7 @@ async function main(): Promise<void> {
     (block): block is Extract<typeof block, { type: "text" }> => block.type === "text",
   );
   if (!textBlock || textBlock.text.trim().length === 0) {
+    await cleanupEphemeralSession(sessionManager, args.session);
     fail("Model produced no text content (only thinking/tool-call/image blocks).", 4);
   }
 
@@ -166,6 +219,7 @@ async function main(): Promise<void> {
   try {
     parsed = JSON.parse(textBlock.text);
   } catch (err) {
+    await cleanupEphemeralSession(sessionManager, args.session);
     fail(
       `Model output was not valid JSON despite constrained decoding: ${err instanceof Error ? err.message : String(err)}\nRaw output: ${textBlock.text}`,
       4,
@@ -175,23 +229,30 @@ async function main(): Promise<void> {
   const ajv = new Ajv({ strict: false, allowUnionTypes: true });
   const validate = ajv.compile(schema);
   if (!validate(parsed)) {
+    await cleanupEphemeralSession(sessionManager, args.session);
     fail(`Model output did not validate against --json-schema: ${ajv.errorsText(validate.errors)}`, 5);
   }
 
   if (args.session) {
-    // Deferred for the same profile-ordering reason as the batch above, and
-    // to avoid loading session-manager's dependency graph on the (default)
-    // --no-session path.
-    const { SessionManager } = await import("@oh-my-pi/pi-coding-agent/session/session-manager");
-    const manager = SessionManager.create(args.cwd);
-    manager.appendMessage(userMessage);
-    manager.appendMessage(result);
-    await manager.ensureOnDisk();
-    await manager.close();
+    if (!sessionManager) {
+      // Same profile-ordering reason as the batch above, and to avoid
+      // loading session-manager's dependency graph on the (default)
+      // --no-session, no-recovery-needed path.
+      const { SessionManager } = await import("@oh-my-pi/pi-coding-agent/session/session-manager");
+      sessionManager = SessionManager.create(args.cwd);
+      sessionManager.appendMessage(userMessage);
+      sessionManager.appendMessage(result);
+      await sessionManager.ensureOnDisk();
+    }
+    await sessionManager.close();
     process.stderr.write(
-      `[omp-structured] session written: id=${manager.getSessionId()} file=${manager.getSessionFile()}\n`,
+      `[omp-structured] session written: id=${sessionManager.getSessionId()} file=${sessionManager.getSessionFile()}\n`,
     );
-    if (args.printSessionId) process.stderr.write(`SESSION_ID=${manager.getSessionId()}\n`);
+    if (args.printSessionId) process.stderr.write(`SESSION_ID=${sessionManager.getSessionId()}\n`);
+  } else {
+    // The recovery path above always needs a real on-disk session to read
+    // back; when the caller didn't ask for --session, leave no artifact.
+    await cleanupEphemeralSession(sessionManager, false);
   }
 
   process.stdout.write(`${JSON.stringify(parsed)}\n`);

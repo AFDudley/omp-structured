@@ -4,7 +4,9 @@
 # mocks — every check below is a live subprocess invocation of dist/cli.js.
 #
 # Reports each check's pass/fail plainly, including the large-schema
-# reliability check as an explicit N/5 count. Exits non-zero if any REQUIRED
+# reliability check as an explicit N/5 count and, for each of the 5 runs, how
+# many needed the one-shot session-read continuation (src/session-recovery.ts)
+# now that the bounded retry loop is gone. Exits non-zero if any REQUIRED
 # check (a, b, d) fails; the Anthropic check (c) is best-effort and reported
 # separately since it depends on network/auth reachability outside this repo.
 set -uo pipefail
@@ -47,10 +49,10 @@ fi
 echo
 
 echo "================================================================"
-echo "(b) LARGE schema (exo-3904 case) vs vllm/qwen3.8-27b-ablit, x5 for reliability"
+echo "(b) LARGE schema (exo-3904 case, exophial.ops.typed_intake.proposal_or_escalate_schema()) vs vllm/qwen3.8-27b-ablit, x5 for reliability"
 echo "================================================================"
-if command -v uv >/dev/null 2>&1 && uv run --project "${EXOPHIAL_REPO:-$HOME/code/git_puller/repos/exophial}" python3 -c \
-  'import json,exophial.ops.derivation_schema as d; print(json.dumps(d.proposal_or_escalate_schema()))' > "$LARGE_SCHEMA" 2>/tmp/omp-structured-schema.err; then
+if command -v uv >/dev/null 2>&1 && PYTHONPATH="${EXOPHIAL_REPO:-$HOME/code/git_puller/repos/exophial}/src" uv run --project "${EXOPHIAL_REPO:-$HOME/code/git_puller/repos/exophial}" python3 -c \
+  'import json, exophial.ops.typed_intake as d; print(json.dumps(d.proposal_or_escalate_schema()))' > "$LARGE_SCHEMA" 2>/tmp/omp-structured-schema.err; then
   echo "Using exophial's real proposal_or_escalate_schema() ($(wc -c < "$LARGE_SCHEMA") bytes)"
 else
   echo "exophial not importable ($(cat /tmp/omp-structured-schema.err 2>/dev/null)); synthesizing a comparable-size/depth schema"
@@ -86,15 +88,19 @@ EOF
 
 large_pass=0
 large_total=5
+large_continuations=0
 for i in $(seq 1 $large_total); do
   echo "--- run $i/$large_total ---"
   start=$(date +%s)
   out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$LARGE_SCHEMA" --prompt "$LARGE_PROMPT" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-b-$i.err)
   code=$?
   elapsed=$(( $(date +%s) - start ))
-  retries=$(grep -c "ended inside the model's reasoning" /tmp/omp-structured-b-$i.err || true)
+  needed_continuation=$(grep -c "one-shot session read" /tmp/omp-structured-b-$i.err || true)
+  if [ "$needed_continuation" -gt 0 ]; then
+    large_continuations=$((large_continuations + 1))
+  fi
   if [ $code -eq 0 ]; then
-    echo "PASS (${elapsed}s, ${retries} internal answer-retries): $out"
+    echo "PASS (${elapsed}s, one-shot session-read continuation needed: $([ "$needed_continuation" -gt 0 ] && echo yes || echo no)): $out"
     large_pass=$((large_pass + 1))
   else
     echo "FAIL (${elapsed}s, exit $code):"
@@ -102,7 +108,7 @@ for i in $(seq 1 $large_total); do
   fi
 done
 echo
-echo "LARGE-SCHEMA RESULT: ${large_pass}/${large_total} schema-valid"
+echo "LARGE-SCHEMA RESULT: ${large_pass}/${large_total} schema-valid; ${large_continuations}/${large_total} needed the one-shot session-read continuation"
 if [ "$large_pass" -ne "$large_total" ]; then
   echo "NOT 5/5 RELIABLE — reporting plainly as required."
   overall_pass=false
