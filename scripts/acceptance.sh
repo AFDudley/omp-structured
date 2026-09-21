@@ -11,6 +11,7 @@ set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+chmod +x dist/cli.js 2>/dev/null || true
 CLI="./dist/cli.js"
 SCRATCH_CWD="${OMP_STRUCTURED_ACCEPTANCE_CWD:-/tmp/omp-structured-acceptance-cwd}"
 mkdir -p "$SCRATCH_CWD"
