@@ -74,8 +74,8 @@ export class NoSessionFileError extends Error {
 }
 
 /**
- * The continuation call's last-mile guarantee that the model does not
- * re-enter its own reasoning segment. Measured directly against real vLLM:
+ * The unconditional last-mile guarantee that a request actually carries no
+ * reasoning/thinking wire fields. Measured directly against real vLLM:
  * `disableReasoning: true` on `completionOptions` alone is NOT sufficient -
  * `openai-completions.ts`'s own per-provider-session reasoning-effort state
  * can still stamp a concrete wire effort (observed: `chat_template_kwargs:
@@ -87,8 +87,15 @@ export class NoSessionFileError extends Error {
  * populated to "off" here is unconditional and independent of that internal
  * state. Only flips fields already present on the wire body - never adds an
  * unknown top-level key a strict-schema server (e.g. NIM) might reject.
+ *
+ * Used both by the one-shot continuation call below (always forces
+ * reasoning off) and, from cli.ts, by `--reasoning off` on the primary
+ * turn - the same wire-level gap applies there for exactly the same
+ * reason: `disableReasoning: true` reaches `SimpleStreamOptions` but
+ * `openai-completions.ts`'s ambient per-model reasoning-effort default can
+ * still stamp a concrete effort onto the wire body underneath it.
  */
-function forceReasoningOffOnWire(payload: Record<string, unknown>): Record<string, unknown> {
+export function forceReasoningOffOnWire(payload: Record<string, unknown>): Record<string, unknown> {
   const next: Record<string, unknown> = { ...payload };
   if ("enable_thinking" in next) next.enable_thinking = false;
   if ("reasoning_effort" in next) delete next.reasoning_effort;
@@ -108,16 +115,27 @@ function forceReasoningOffOnWire(payload: Record<string, unknown>): Record<strin
  * Resolve a single answerless (reasoning-only) turn by reading it back from
  * disk and issuing AT MOST ONE deterministic continuation turn in the same
  * session. Never loops, never regenerates from scratch.
+ *
+ * `priorMessages` is the full turn history that led to `answerlessResult`
+ * (a single-element `[userMessage]` for the `--prompt` shortcut, or the
+ * whole `--messages` transcript) — every entry is persisted, in order,
+ * before the answerless result itself. `systemPrompt` is forwarded
+ * unchanged onto the continuation's `Context`: the persisted-session reload
+ * below only reconstructs `Context.messages`, never `Context.systemPrompt`
+ * (system prompt is provider request configuration, not conversation
+ * history — omp's own session writer does not persist it as a message
+ * either), so it would otherwise silently drop on the continuation turn.
  */
 export async function resolveAnswerlessTurnViaSession(
   manager: SessionManagerHandle,
-  userMessage: UserMessage,
+  priorMessages: readonly Message[],
   answerlessResult: AssistantMessage,
   model: unknown,
   completionOptions: Record<string, unknown>,
   deps: OneShotRecoveryDeps,
+  systemPrompt?: string[],
 ): Promise<OneShotRecoveryResult> {
-  manager.appendMessage(userMessage);
+  for (const message of priorMessages) manager.appendMessage(message);
   manager.appendMessage(answerlessResult);
   await manager.ensureOnDisk();
 
@@ -141,7 +159,7 @@ export async function resolveAnswerlessTurnViaSession(
   }
 
   const continuationPrompt: UserMessage = { role: "user", content: CONTINUATION_PROMPT, timestamp: Date.now() };
-  const continuationContext: Context = { messages: [...persistedMessages, continuationPrompt] };
+  const continuationContext: Context = { systemPrompt, messages: [...persistedMessages, continuationPrompt] };
   const baseOnPayload = completionOptions.onPayload as ((payload: unknown) => unknown) | undefined;
   const continuationResult = await deps.completeSimple(model, continuationContext, {
     ...completionOptions,

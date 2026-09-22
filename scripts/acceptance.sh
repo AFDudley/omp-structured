@@ -1,17 +1,21 @@
 #!/usr/bin/env bash
 # Acceptance checks for omp-structured, run against REAL omp config/auth and
 # REAL backends (vLLM always; Anthropic when reachable) plus the pure-function
-# unit tests for every api family with no live credentials here. No stand-ins,
-# no mocks in (a)-(d) — every one of those is a live subprocess invocation of
-# dist/cli.js against a real backend.
+# unit tests for every api family/arg-parsing/transcript-assembly case with no
+# live credentials required. No stand-ins, no mocks in (a)-(e) — every one of
+# those is a live subprocess invocation of dist/cli.js against a real backend.
 #
-# Reports each check's pass/fail plainly, including the large-schema
-# reliability check as an explicit N/5 count and, for each of the 5 runs, how
-# many needed the one-shot session-read continuation (src/session-recovery.ts)
-# now that the bounded retry loop is gone. Exits non-zero if any REQUIRED
-# check (a, b, d, e) fails; the Anthropic check (c) is best-effort and
-# reported separately since it depends on network/auth reachability outside
-# this repo.
+# Lettering matches the CLI's full input contract:
+#   (a) large-schema (~22KB exophial proposal_or_escalate_schema) reliability, x5, vs vLLM
+#   (b) --system-prompt demonstrably changes output, both directions, vs vLLM
+#   (c) --messages carries a multi-turn transcript, and --prompt+--messages is rejected, vs vLLM
+#   (d) --reasoning is honored and independently observable on the real wire body, vs vLLM
+#   (e) --system-prompt vs real Anthropic (best-effort; depends on the auth broker being reachable)
+#   (f) unit tests: arg parsing (mutual exclusion, reasoning enum) + transcript assembly (message-array validation) + per-api payload injection
+#   (g) --session still produces a real session .jsonl (regression check for pre-existing behavior)
+# Exits non-zero if any REQUIRED check (a, b, c, d, f, g) fails; (e) is
+# best-effort and reported separately since it depends on network/auth
+# reachability outside this repo.
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -25,38 +29,28 @@ TRIVIAL_SCHEMA=$(mktemp)
 TRIVIAL_PROMPT=$(mktemp)
 LARGE_SCHEMA=$(mktemp)
 LARGE_PROMPT=$(mktemp)
-trap 'rm -f "$TRIVIAL_SCHEMA" "$TRIVIAL_PROMPT" "$LARGE_SCHEMA" "$LARGE_PROMPT"' EXIT
+SYSTEM_PROMPT=$(mktemp)
+TRANSCRIPT=$(mktemp)
+trap 'rm -f "$TRIVIAL_SCHEMA" "$TRIVIAL_PROMPT" "$LARGE_SCHEMA" "$LARGE_PROMPT" "$SYSTEM_PROMPT" "$TRANSCRIPT"' EXIT
 
 cat > "$TRIVIAL_SCHEMA" << 'EOF'
-{"type":"object","properties":{"answer":{"type":"string"},"n":{"type":"integer"}},"required":["answer","n"],"additionalProperties":false}
+{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}
 EOF
 cat > "$TRIVIAL_PROMPT" << 'EOF'
-Reply with an object: answer should be the string "hello", n should be the integer 42.
+Reply with an object: answer should be any short string of your choosing.
 EOF
 
 overall_pass=true
 
 echo "================================================================"
-echo "(a) trivial schema vs vllm/qwen3.8-27b-ablit"
-echo "================================================================"
-out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-a.err)
-code=$?
-cat /tmp/omp-structured-a.err
-if [ $code -eq 0 ]; then
-  echo "STDOUT: $out"
-  echo "RESULT: PASS (exit 0, schema-valid object)"
-else
-  echo "RESULT: FAIL (exit $code)"
-  overall_pass=false
-fi
-echo
-
-echo "================================================================"
-echo "(b) LARGE schema (exo-3904 case, exophial.ops.typed_intake.proposal_or_escalate_schema()) vs vllm/qwen3.8-27b-ablit, x5 for reliability"
+echo "(a) LARGE schema (exo-3904 case, exophial.ops.derivation_schema.proposal_or_escalate_schema()) vs vllm/qwen3.8-27b-ablit, x5 for reliability"
 echo "================================================================"
 if command -v uv >/dev/null 2>&1 && PYTHONPATH="${EXOPHIAL_REPO:-$HOME/code/git_puller/repos/exophial}/src" uv run --project "${EXOPHIAL_REPO:-$HOME/code/git_puller/repos/exophial}" python3 -c \
-  'import json, exophial.ops.typed_intake as d; print(json.dumps(d.proposal_or_escalate_schema()))' > "$LARGE_SCHEMA" 2>/tmp/omp-structured-schema.err; then
+  'import json, exophial.ops.derivation_schema as d; print(json.dumps(d.proposal_or_escalate_schema()))' > "$LARGE_SCHEMA" 2>/tmp/omp-structured-schema.err; then
   echo "Using exophial's real proposal_or_escalate_schema() ($(wc -c < "$LARGE_SCHEMA") bytes)"
+elif [ -x "$HOME/.local/share/uv/tools/exophial/bin/python" ] && "$HOME/.local/share/uv/tools/exophial/bin/python" -c \
+  'import json, exophial.ops.derivation_schema as d; print(json.dumps(d.proposal_or_escalate_schema()))' > "$LARGE_SCHEMA" 2>/tmp/omp-structured-schema.err; then
+  echo "Using exophial's real proposal_or_escalate_schema() via the installed exophial interpreter ($(wc -c < "$LARGE_SCHEMA") bytes)"
 else
   echo "exophial not importable ($(cat /tmp/omp-structured-schema.err 2>/dev/null)); synthesizing a comparable-size/depth schema"
   python3 - > "$LARGE_SCHEMA" << 'PYEOF'
@@ -95,10 +89,10 @@ large_continuations=0
 for i in $(seq 1 $large_total); do
   echo "--- run $i/$large_total ---"
   start=$(date +%s)
-  out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$LARGE_SCHEMA" --prompt "$LARGE_PROMPT" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-b-$i.err)
+  out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$LARGE_SCHEMA" --prompt "$LARGE_PROMPT" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-a-$i.err)
   code=$?
   elapsed=$(( $(date +%s) - start ))
-  needed_continuation=$(grep -c "one-shot session read" /tmp/omp-structured-b-$i.err || true)
+  needed_continuation=$(grep -c "one-shot session read" /tmp/omp-structured-a-$i.err || true)
   if [ "$needed_continuation" -gt 0 ]; then
     large_continuations=$((large_continuations + 1))
   fi
@@ -107,7 +101,7 @@ for i in $(seq 1 $large_total); do
     large_pass=$((large_pass + 1))
   else
     echo "FAIL (${elapsed}s, exit $code):"
-    cat /tmp/omp-structured-b-$i.err
+    cat /tmp/omp-structured-a-$i.err
   fi
 done
 echo
@@ -119,42 +113,120 @@ fi
 echo
 
 echo "================================================================"
-echo "(c) trivial schema vs anthropic/claude-sonnet-5 (best-effort; reachability-dependent)"
+echo "(b) --system-prompt demonstrably changes output vs vllm/qwen3.8-27b-ablit (both directions)"
 echo "================================================================"
-if out=$("$CLI" --model anthropic/claude-sonnet-5 --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-c.err); then
-  echo "STDOUT: $out"
-  echo "RESULT: PASS (exit 0, schema-valid object)"
+cat > "$SYSTEM_PROMPT" << 'EOF'
+Always set answer to the exact string SYSTEMOK, regardless of what the user asks.
+EOF
+with_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --system-prompt "$SYSTEM_PROMPT" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-b-with.err)
+with_code=$?
+without_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-b-without.err)
+without_code=$?
+echo "WITH --system-prompt:    exit=$with_code stdout=$with_out"
+echo "WITHOUT --system-prompt: exit=$without_code stdout=$without_out"
+if [ $with_code -eq 0 ] && [ $without_code -eq 0 ] && echo "$with_out" | grep -q '"answer":"SYSTEMOK"' && ! echo "$without_out" | grep -q '"answer":"SYSTEMOK"'; then
+  echo "RESULT: PASS (system prompt honored with the flag, not honored without it)"
 else
-  code=$?
-  echo "RESULT: SKIPPED/FAILED (exit $code) — anthropic not reachable via omp auth broker, or another error:"
-  cat /tmp/omp-structured-c.err
-fi
-echo
-
-echo "================================================================"
-echo "(d) --session writes a real session .jsonl under ~/.omp/agent/sessions/<cwd-slug>/"
-echo "================================================================"
-out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --cwd "$SCRATCH_CWD" --session --print-session-id 2>/tmp/omp-structured-d.err)
-code=$?
-cat /tmp/omp-structured-d.err
-session_id=$(grep -oE 'SESSION_ID=[a-zA-Z0-9-]+' /tmp/omp-structured-d.err | cut -d= -f2)
-session_file=$(grep -oE 'file=\S+' /tmp/omp-structured-d.err | head -1 | cut -d= -f2)
-if [ $code -eq 0 ] && [ -n "$session_id" ] && [ -f "$session_file" ] && grep -q "\"id\":\"$session_id\"" "$session_file"; then
-  echo "STDOUT: $out"
-  echo "session id: $session_id"
-  echo "session file: $session_file"
-  echo "RESULT: PASS (file exists on disk, header id matches reported id)"
-else
-  echo "RESULT: FAIL (exit $code, session_id='$session_id', session_file='$session_file')"
+  echo "RESULT: FAIL"
   overall_pass=false
 fi
 echo
 
 echo "================================================================"
-echo "(e) per-api unit tests for every api family with no live credentials here (pure functions, no network)"
+echo "(c) --messages carries a multi-turn transcript vs vllm/qwen3.8-27b-ablit; --prompt+--messages together is rejected"
 echo "================================================================"
-if bun test src 2>&1 | tee /tmp/omp-structured-e.out; then
-  echo "RESULT: PASS (all payload-injection.test.ts cases passed)"
+cat > "$TRANSCRIPT" << 'EOF'
+[
+  {"role": "user", "content": "I'm going to tell you a secret code word. Just acknowledge it briefly."},
+  {"role": "assistant", "content": "Understood, please share the code word."},
+  {"role": "user", "content": "The secret code word is FLAMINGO77. Now, respond with the JSON object: set answer to exactly the secret code word I just gave you, nothing else."}
+]
+EOF
+transcript_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$TRIVIAL_SCHEMA" --messages "$TRANSCRIPT" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-c.err)
+transcript_code=$?
+echo "--messages run: exit=$transcript_code stdout=$transcript_out"
+"$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$TRIVIAL_SCHEMA" --messages "$TRANSCRIPT" --prompt "$TRIVIAL_PROMPT" --cwd "$SCRATCH_CWD" >/tmp/omp-structured-c-reject.out 2>/tmp/omp-structured-c-reject.err
+reject_code=$?
+echo "--prompt + --messages together: exit=$reject_code (expect 2)"
+if [ $transcript_code -eq 0 ] && echo "$transcript_out" | grep -q '"answer":"FLAMINGO77"' && [ $reject_code -eq 2 ]; then
+  echo "RESULT: PASS (answer reflects the transcript's earlier assistant turn; --prompt+--messages rejected)"
+else
+  echo "RESULT: FAIL"
+  overall_pass=false
+fi
+echo
+
+echo "================================================================"
+echo "(d) --reasoning is honored and reaches the real wire body vs vllm/qwen3.8-27b-ablit"
+echo "================================================================"
+off_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --reasoning off --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-d-off.err)
+off_code=$?
+off_wire=$(grep "wire reasoning fields" /tmp/omp-structured-d-off.err | tail -1)
+echo "--reasoning off:  exit=$off_code stdout=$off_out"
+echo "                  $off_wire"
+# This model's own catalog entry (~/.omp/agent/models.yml) restricts which
+# Effort values it accepts; asking for an unsupported one is a real,
+# expected completion failure (see README "System prompt, multi-turn
+# transcripts, and reasoning effort"), not a bug in this CLI. Try "high"
+# first per the documented contract; fall back to "xhigh" (this model's
+# actual highest supported effort) and report which one was used.
+high_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --reasoning high --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-d-high.err)
+high_code=$?
+high_level="high"
+if [ $high_code -ne 0 ] && grep -q "is not supported by" /tmp/omp-structured-d-high.err; then
+  echo "--reasoning high: exit=$high_code REJECTED by this model's own catalog entry ($(grep 'is not supported by' /tmp/omp-structured-d-high.err)); falling back to --reasoning xhigh"
+  high_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --reasoning xhigh --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-d-high.err)
+  high_code=$?
+  high_level="xhigh"
+fi
+high_wire=$(grep "wire reasoning fields" /tmp/omp-structured-d-high.err | tail -1)
+echo "--reasoning $high_level: exit=$high_code stdout=$high_out"
+echo "                  $high_wire"
+if [ $off_code -eq 0 ] && [ $high_code -eq 0 ] && echo "$off_wire" | grep -q '"enable_thinking":false' && ! echo "$off_wire" | grep -q "reasoning_effort" && echo "$high_wire" | grep -q "\"reasoning_effort\":\"$high_level\""; then
+  echo "RESULT: PASS (both schema-valid; the real wire body's reasoning fields differ exactly as --reasoning requested)"
+else
+  echo "RESULT: FAIL"
+  overall_pass=false
+fi
+echo
+
+echo "================================================================"
+echo "(e) --system-prompt vs anthropic/claude-sonnet-5 (best-effort; reachability-dependent)"
+echo "================================================================"
+if out=$("$CLI" --model anthropic/claude-sonnet-5 --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --system-prompt "$SYSTEM_PROMPT" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-e.err); then
+  echo "STDOUT: $out"
+  if echo "$out" | grep -q '"answer":"SYSTEMOK"'; then
+    echo "RESULT: PASS (exit 0, schema-valid, system prompt honored)"
+  else
+    echo "RESULT: FAIL (schema-valid but system prompt not honored)"
+  fi
+else
+  echo "RESULT: SKIPPED/FAILED (best-effort; see /tmp/omp-structured-e.err)"
+  cat /tmp/omp-structured-e.err
+fi
+echo
+
+echo "================================================================"
+echo "(f) unit tests: arg parsing, transcript assembly, per-api payload injection (pure functions, no network)"
+echo "================================================================"
+if bun test src 2>&1 | tee /tmp/omp-structured-f.out; then
+  echo "RESULT: PASS (args.test.ts + transcript.test.ts + payload-injection.test.ts all passed)"
+else
+  echo "RESULT: FAIL"
+  overall_pass=false
+fi
+echo
+
+echo "================================================================"
+echo "(g) --session still writes a real session .jsonl under ~/.omp/agent/sessions/<cwd-slug>/ (regression check)"
+echo "================================================================"
+out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --cwd "$SCRATCH_CWD" --session --print-session-id 2>/tmp/omp-structured-g.err)
+code=$?
+cat /tmp/omp-structured-g.err
+session_id=$(grep -oE 'SESSION_ID=[a-zA-Z0-9-]+' /tmp/omp-structured-g.err | cut -d= -f2)
+session_file=$(grep -oE 'file=\S+' /tmp/omp-structured-g.err | head -1 | cut -d= -f2)
+if [ $code -eq 0 ] && [ -n "$session_id" ] && [ -f "$session_file" ] && grep -q "\"id\":\"$session_id\"" "$session_file"; then
+  echo "RESULT: PASS (file exists on disk, header id matches reported id)"
 else
   echo "RESULT: FAIL"
   overall_pass=false
@@ -165,7 +237,7 @@ echo "================================================================"
 echo "SUMMARY"
 echo "================================================================"
 if $overall_pass; then
-  echo "All required checks (a, b, d, e) passed. See above for (c)."
+  echo "All required checks (a, b, c, d, f, g) passed. See above for (e)."
   exit 0
 else
   echo "At least one required check FAILED. See above."

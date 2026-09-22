@@ -7,9 +7,10 @@
  *
  * See README.md for the design rationale (exo-3904 / exo-c441),
  * src/payload-injection.ts for exactly how each api family is constrained,
- * and src/session-recovery.ts for the one-shot session-read recovery this
- * file drives when a reasoning model ends its turn without ever leaving its
- * own `<think>` segment.
+ * src/transcript.ts for how --system-prompt/--messages assemble into omp's
+ * Context, and src/session-recovery.ts for the one-shot session-read
+ * recovery this file drives when a reasoning model ends its turn without
+ * ever leaving its own `<think>` segment.
  *
  * Profile handling: omp resolves `OMP_PROFILE` at MODULE LOAD time in
  * @oh-my-pi/pi-utils/dirs (before any of our code runs), so `--profile` must
@@ -24,10 +25,22 @@ import * as fs from "node:fs/promises";
 import { default as Ajv } from "ajv";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type { AssistantMessage, Context, Message, UserMessage } from "@oh-my-pi/pi-ai/types";
-import { CliArgError, type CliArgs, parseArgs } from "./args.js";
+import { CliArgError, type CliArgs, parseArgs, type ReasoningEffort } from "./args.js";
 import { isStdinRequested, readPathOrStdin } from "./io.js";
 import { buildConstrainedOnPayload, type ConstrainedOnPayload, type JsonSchema, UnsupportedApiError } from "./payload-injection.js";
-import { isAnswerlessStop, resolveAnswerlessTurnViaSession, type SessionManagerHandle } from "./session-recovery.js";
+import {
+  forceReasoningOffOnWire,
+  isAnswerlessStop,
+  resolveAnswerlessTurnViaSession,
+  type SessionManagerHandle,
+} from "./session-recovery.js";
+import {
+  assembleTranscriptContext,
+  type AssembledTranscript,
+  parseMessagesJson,
+  type TranscriptEntry,
+  TranscriptValidationError,
+} from "./transcript.js";
 
 function fail(message: string, exitCode: number): never {
   process.stderr.write(`${message}\n`);
@@ -50,14 +63,35 @@ async function cleanupEphemeralSession(sessionManager: SessionManagerHandle | un
   if (sessionFile) await fs.unlink(sessionFile).catch(() => undefined);
 }
 
-async function readSchemaAndPrompt(args: CliArgs): Promise<{ schema: JsonSchema; promptText: string }> {
-  if (isStdinRequested(args.jsonSchemaPath) && isStdinRequested(args.promptPath)) {
-    fail("--json-schema and --prompt cannot both read from stdin; give at least one an explicit file path.", 2);
+/** Raw (unparsed-against-model) inputs read from disk/stdin: the schema, and either a single prompt or a --messages transcript, plus an optional --system-prompt. */
+interface RawInputs {
+  schema: JsonSchema;
+  promptText: string | undefined;
+  messagesEntries: TranscriptEntry[] | undefined;
+  systemPromptText: string | undefined;
+}
+
+async function readRawInputs(args: CliArgs): Promise<RawInputs> {
+  // At most one input may read stdin; the second stdin read would observe
+  // an already-drained empty stream. --prompt and --messages are mutually
+  // exclusive (enforced in parseArgs), so exactly one of them contributes to
+  // this stdin-conflict check, never both.
+  const stdinRequests: string[] = [];
+  if (isStdinRequested(args.jsonSchemaPath)) stdinRequests.push("--json-schema");
+  if (args.messagesPath !== undefined) {
+    if (isStdinRequested(args.messagesPath)) stdinRequests.push("--messages");
+  } else if (isStdinRequested(args.promptPath)) {
+    stdinRequests.push("--prompt");
+  }
+  if (args.systemPromptPath !== undefined && isStdinRequested(args.systemPromptPath)) stdinRequests.push("--system-prompt");
+  if (stdinRequests.length > 1) {
+    fail(`${stdinRequests.join(" and ")} cannot all read from stdin; give all but one an explicit file path.`, 2);
   }
 
-  const [schemaText, promptText] = await Promise.all([
+  const [schemaText, promptOrMessagesText, systemPromptRaw] = await Promise.all([
     readPathOrStdin(args.jsonSchemaPath),
-    readPathOrStdin(args.promptPath),
+    args.messagesPath !== undefined ? readPathOrStdin(args.messagesPath) : readPathOrStdin(args.promptPath),
+    args.systemPromptPath !== undefined ? readPathOrStdin(args.systemPromptPath) : Promise.resolve(undefined),
   ]);
 
   let schema: unknown;
@@ -69,9 +103,45 @@ async function readSchemaAndPrompt(args: CliArgs): Promise<{ schema: JsonSchema;
   if (typeof schema !== "object" || schema === null || Array.isArray(schema)) {
     fail("--json-schema must be a JSON object.", 2);
   }
-  if (promptText.trim().length === 0) fail("Prompt is empty.", 2);
 
-  return { schema: schema as JsonSchema, promptText };
+  if (args.systemPromptPath !== undefined && systemPromptRaw !== undefined && systemPromptRaw.trim().length === 0) {
+    fail("--system-prompt is empty.", 2);
+  }
+
+  if (args.messagesPath !== undefined) {
+    let messagesEntries: TranscriptEntry[];
+    try {
+      messagesEntries = parseMessagesJson(promptOrMessagesText);
+    } catch (err) {
+      if (err instanceof TranscriptValidationError) fail(err.message, 2);
+      throw err;
+    }
+    return { schema: schema as JsonSchema, promptText: undefined, messagesEntries, systemPromptText: systemPromptRaw };
+  }
+
+  if (promptOrMessagesText.trim().length === 0) fail("Prompt is empty.", 2);
+  return { schema: schema as JsonSchema, promptText: promptOrMessagesText, messagesEntries: undefined, systemPromptText: systemPromptRaw };
+}
+
+/** Reasoning-related wire field names actually observed across omp's api families (see session-recovery.ts's forceReasoningOffOnWire for the vLLM/openai-completions set this was measured against). Logged, never mutated, so --reasoning's effect on the real wire body is independently inspectable (stderr), not just trusted. */
+const REASONING_WIRE_FIELDS = ["reasoning_effort", "chat_template_kwargs", "thinking", "reasoning"] as const;
+
+function logReasoningWireFields(payload: Record<string, unknown>): void {
+  const fields: Record<string, unknown> = {};
+  for (const key of REASONING_WIRE_FIELDS) {
+    if (key in payload) fields[key] = payload[key];
+  }
+  if (Object.keys(fields).length > 0) {
+    process.stderr.write(`[omp-structured] wire reasoning fields: ${JSON.stringify(fields)}\n`);
+  }
+}
+
+/** Maps --reasoning onto completeSimple's SimpleStreamOptions. "off" -> disableReasoning (there is no Effort member for "off" - see args.ts); undefined (flag absent) preserves this CLI's pre-existing default of Effort.Medium for reasoning-capable models; every other value is a verified Effort enum member, forwarded as-is. */
+function resolveReasoningOptions(reasoning: ReasoningEffort | undefined, modelReasons: boolean): { reasoning: Effort | undefined; disableReasoning: boolean | undefined } {
+  if (!modelReasons) return { reasoning: undefined, disableReasoning: undefined };
+  if (reasoning === undefined) return { reasoning: Effort.Medium, disableReasoning: undefined };
+  if (reasoning === "off") return { reasoning: undefined, disableReasoning: true };
+  return { reasoning: reasoning as Effort, disableReasoning: undefined };
 }
 
 async function main(): Promise<void> {
@@ -86,7 +156,7 @@ async function main(): Promise<void> {
   // MUST happen before any omp SDK import (see file header).
   if (args.profile) process.env.OMP_PROFILE = args.profile;
 
-  const { schema, promptText } = await readSchemaAndPrompt(args);
+  const rawInputs = await readRawInputs(args);
 
   // Deliberately dynamic: every omp SDK module transitively loads
   // @oh-my-pi/pi-utils/dirs, which reads OMP_PROFILE once at first import.
@@ -111,17 +181,63 @@ async function main(): Promise<void> {
   const model = resolveModelFromString(args.model, modelRegistry.getAvailable("chat"));
   if (!model) fail(`Could not resolve --model "${args.model}" against ~/.omp/agent/models.yml.`, 2);
 
-  let onPayload: ConstrainedOnPayload;
+  let baseOnPayload: ConstrainedOnPayload;
   try {
-    onPayload = buildConstrainedOnPayload(model.api, schema);
+    baseOnPayload = buildConstrainedOnPayload(model.api, rawInputs.schema);
   } catch (err) {
     if (err instanceof UnsupportedApiError) fail(err.message, 3);
     throw err;
   }
+  const { reasoning, disableReasoning } = resolveReasoningOptions(args.reasoning, Boolean(model.reasoning));
+
+  // Composes the schema constraint with a non-mutating wire-level log of
+  // every reasoning-related field actually present on the outgoing payload,
+  // so --reasoning's effect is independently inspectable on stderr (see
+  // README "Reasoning effort" and acceptance check (d)) rather than merely
+  // trusted to have reached the provider. When the caller explicitly asked
+  // for --reasoning off, also applies forceReasoningOffOnWire
+  // (session-recovery.ts): `disableReasoning: true` alone reaches
+  // SimpleStreamOptions but does not stop openai-completions.ts's own
+  // ambient per-model reasoning-effort default from stamping a concrete
+  // effort onto the wire body underneath it (the same gap the one-shot
+  // continuation's forced-off path already had to work around).
+  const onPayload: ConstrainedOnPayload = payload => {
+    const afterSchema = baseOnPayload(payload);
+    const forcedOff = disableReasoning && afterSchema ? forceReasoningOffOnWire(afterSchema) : afterSchema;
+    const wireBody = (forcedOff ?? payload) as Record<string, unknown>;
+    logReasoningWireFields(wireBody);
+    return forcedOff;
+  };
+
+  // Build the Context this turn sends: either the --messages transcript
+  // (optionally prefixed by --system-prompt and/or the transcript's own
+  // leading system entry) or the --prompt single-user-message shortcut
+  // (optionally prefixed by --system-prompt alone). See transcript.ts for
+  // exactly how Context.systemPrompt/Context.messages map onto the wire.
+  let contextMessages: Message[];
+  let systemPrompt: string[] | undefined;
+  if (rawInputs.messagesEntries) {
+    let assembled: AssembledTranscript;
+    try {
+      assembled = assembleTranscriptContext(rawInputs.messagesEntries, rawInputs.systemPromptText, {
+        api: model.api,
+        provider: model.provider,
+        id: model.id,
+      });
+    } catch (err) {
+      if (err instanceof TranscriptValidationError) fail(err.message, 2);
+      throw err;
+    }
+    contextMessages = assembled.messages;
+    systemPrompt = assembled.systemPrompt;
+  } else {
+    const userMessage: UserMessage = { role: "user", content: rawInputs.promptText ?? "", timestamp: Date.now() };
+    contextMessages = [userMessage];
+    systemPrompt = rawInputs.systemPromptText !== undefined ? [rawInputs.systemPromptText] : undefined;
+  }
+  const context: Context = { systemPrompt, messages: contextMessages };
 
   const apiKey = await modelRegistry.getApiKey(model);
-  const userMessage: UserMessage = { role: "user", content: promptText, timestamp: Date.now() };
-  const context: Context = { messages: [userMessage] };
 
   const controller = new AbortController();
   const timer = setTimeout(
@@ -141,9 +257,11 @@ async function main(): Promise<void> {
       signal: controller.signal,
       // "medium" measurably reduces answerless reasoning-only stops versus
       // omp's ambient "low" default for this local model (see README
-      // "Known local-model reliability note"); only reasoning-capable
-      // models accept a `reasoning` option at all.
-      reasoning: model.reasoning ? Effort.Medium : undefined,
+      // "Known local-model reliability note") when --reasoning is not
+      // given; only reasoning-capable models accept a `reasoning` option at
+      // all (see resolveReasoningOptions).
+      reasoning,
+      disableReasoning,
       onPayload,
     };
     result = await completeSimple(model, context, completionOptions);
@@ -163,10 +281,18 @@ async function main(): Promise<void> {
         import("@oh-my-pi/pi-coding-agent/session/session-loader"),
       ]);
       sessionManager = SessionManager.create(args.cwd);
-      const recovery = await resolveAnswerlessTurnViaSession(sessionManager, userMessage, result, model, completionOptions, {
-        loadSessionMessagesReadOnly: filePath => loadSessionMessagesReadOnly(filePath) as unknown as Promise<Message[]>,
-        completeSimple,
-      });
+      const recovery = await resolveAnswerlessTurnViaSession(
+        sessionManager,
+        contextMessages,
+        result,
+        model,
+        completionOptions,
+        {
+          loadSessionMessagesReadOnly: filePath => loadSessionMessagesReadOnly(filePath) as unknown as Promise<Message[]>,
+          completeSimple,
+        },
+        systemPrompt,
+      );
       result = recovery.result;
       if (!recovery.continuationIssued) {
         process.stderr.write("[omp-structured] persisted session already carried answer text; no continuation turn was needed\n");
@@ -227,7 +353,7 @@ async function main(): Promise<void> {
   }
 
   const ajv = new Ajv({ strict: false, allowUnionTypes: true });
-  const validate = ajv.compile(schema);
+  const validate = ajv.compile(rawInputs.schema);
   if (!validate(parsed)) {
     await cleanupEphemeralSession(sessionManager, args.session);
     fail(`Model output did not validate against --json-schema: ${ajv.errorsText(validate.errors)}`, 5);
@@ -240,7 +366,7 @@ async function main(): Promise<void> {
       // --no-session, no-recovery-needed path.
       const { SessionManager } = await import("@oh-my-pi/pi-coding-agent/session/session-manager");
       sessionManager = SessionManager.create(args.cwd);
-      sessionManager.appendMessage(userMessage);
+      for (const message of contextMessages) sessionManager.appendMessage(message);
       sessionManager.appendMessage(result);
       await sessionManager.ensureOnDisk();
     }

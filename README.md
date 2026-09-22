@@ -218,9 +218,10 @@ the caller *did* pass `--session`, the recovery's session IS the one printed
 via `--print-session-id` - the continuation, if any, is part of the same
 session's history, not a second session.
 
-With this in place, `scripts/acceptance.sh`'s 5-run large-schema check
-passed 5/5 against real vLLM, with 5/5 of those runs needing the one-shot
-continuation (see "Acceptance" below for the verbatim run).
+With this in place, `scripts/acceptance.sh`'s 5-run large-schema check has
+passed 5/5 against real vLLM on every measured run, with most (not
+necessarily all) of those runs needing the one-shot continuation — see
+"Acceptance" below for the current verbatim run's exact count.
 
 ## Usage
 
@@ -233,6 +234,18 @@ Required:
 
 Options:
   --prompt <path|->          Prompt file, or - to read it from stdin (default: read the whole prompt from stdin)
+                             Single-user-message shortcut; mutually exclusive with --messages.
+  --messages <path|->        Multi-turn transcript file (or - for stdin): a JSON array of
+                             {role, content} objects, role one of user/assistant, and optionally
+                             a single leading {role:"system", content} entry. Mutually exclusive
+                             with --prompt.
+  --system-prompt <path|->   System prompt file, or - to read it from stdin. Injected via omp's
+                             Context.systemPrompt channel, ahead of --prompt/--messages. Composes
+                             with a leading system entry in --messages (both are appended, in that
+                             order, to the same systemPrompt array).
+  --reasoning <effort>       off|minimal|low|medium|high|xhigh|max (default: medium, matching this
+                             CLI's existing default reasoning effort). Maps to omp's Effort enum;
+                             "off" requests disableReasoning instead of an Effort value.
   --cwd <dir>                Working directory for config/session discovery (default: process cwd)
   --profile <name>           Named omp profile (OMP_PROFILE), same isolation as `omp --profile`
   --session                  Write a real omp session .jsonl for this turn (default: --no-session)
@@ -264,6 +277,80 @@ requires. `dist/cli.js` (built by `tsc`, dependencies left as bare
 specifiers — not bundled) is executed with `bun dist/cli.js ...`, exactly
 like omp's own `dist/cli.js` (`#!/usr/bin/env bun`).
 
+## System prompt, multi-turn transcripts, and reasoning effort
+
+**`--system-prompt` and `--messages`'s own leading system entry both feed
+omp's `Context.systemPrompt: string[]` channel — never a `{role:"system"}`
+message.** `@oh-my-pi/pi-ai/types`' `Context` shape is
+`{ systemPrompt?: string[]; messages: Message[] }`: the system prompt is a
+field on `Context` entirely separate from the message array, and every
+provider that honors it reads it from there (verified against the installed
+`18.2.8` source):
+
+- `providers/openai-completions.ts`'s `normalizeSystemPrompts(context.systemPrompt)`
+  turns it into a leading wire message with `role: "system"`, or
+  `role: "developer"` when `model.reasoning && compat.supportsDeveloperRole`.
+- `providers/anthropic.ts`'s `buildAnthropicSystemBlocks(context.systemPrompt, ...)`
+  turns it into top-level Anthropic `system` blocks (never a message in
+  Anthropic's `messages` array, which has no `system` role at all).
+
+`src/transcript.ts`'s `assembleTranscriptContext` composes `--system-prompt`
+(when given) and `--messages`' own leading `{"role":"system",...}` entry
+(when present) into that same array, in that order, then converts every
+remaining transcript entry into a typed SDK message: `{role:"user"}` becomes
+a `UserMessage`; `{role:"assistant"}` becomes a synthetic `AssistantMessage`
+whose `content` is `[{type:"text", text: entry.content}]`. The
+`AssistantMessage` interface also requires `api`/`provider`/`model`/`usage`/
+`stopReason` bookkeeping fields that a *real* completed turn would carry;
+this CLI fills them with the resolved model's own identity and all-zero
+usage, because none of that metadata is read by the outgoing wire
+serialization for a *prior* turn — verified by reading both providers'
+`msg.role === "assistant"` branches, which build the wire request from
+`.content` alone (`providers/openai-completions.ts` around line 2149;
+`providers/anthropic.ts`'s equivalent branch). `--prompt` (no `--messages`)
+skips `transcript.ts` entirely and builds the same single-`UserMessage`
+`Context` this CLI always has, with `systemPrompt` set to `[text]` when
+`--system-prompt` was given.
+
+**`--reasoning <effort>` maps onto `SimpleStreamOptions.reasoning`, an
+`Effort` value from `@oh-my-pi/pi-catalog/src/effort.ts`.** That module's
+entire runtime vocabulary, read directly from source, is exactly:
+`minimal | low | medium | high | xhigh | max` — there is no `"auto"` member,
+and no other reasoning-related SDK field (`model-thinking.ts`'s
+`requireSupportedEffort`/`defaultSupportedEffort`, `SimpleStreamOptions`
+itself) accepts one either, so `--reasoning auto` is rejected by argument
+parsing rather than silently accepted and ignored. `--reasoning off` is this
+CLI's own vocabulary on top of that enum: it maps to
+`{ reasoning: undefined, disableReasoning: true }` rather than an `Effort`
+member, since `disableReasoning` (not a special `Effort` value) is the SDK's
+actual off-switch. Measured directly against real vLLM,
+`disableReasoning: true` on `completionOptions` **alone is insufficient**:
+`openai-completions.ts`'s own ambient per-model reasoning-effort default can
+still stamp a concrete `chat_template_kwargs.reasoning_effort`/
+`enable_thinking: true` onto the wire body underneath it (the same gap
+`src/session-recovery.ts`'s one-shot continuation already had to work
+around — see "One-shot session-read recovery" above). `--reasoning off`
+therefore also composes `session-recovery.ts`'s exported
+`forceReasoningOffOnWire` onto the request's `onPayload`, the same
+unconditional last-mile wire-level guarantee the continuation call uses.
+Omitting `--reasoning` entirely preserves this CLI's pre-existing default
+(`Effort.Medium` for reasoning-capable models, unconditionally — see "Known
+local-model reliability note" above) with byte-identical behavior to before
+this flag existed. `--reasoning`'s effect on the real wire body is always
+independently inspectable: every completion logs
+`[omp-structured] wire reasoning fields: {...}` to stderr with whatever
+subset of `reasoning_effort`/`chat_template_kwargs`/`thinking`/`reasoning`
+the outgoing payload actually carries, non-mutating and composed after the
+schema-constraint `onPayload`.
+
+A model's own catalog entry can further restrict which `Effort` values it
+accepts — `vllm/qwen3.8-27b-ablit`, on this machine, accepts only
+`low`/`medium`/`xhigh` (`requireSupportedEffort` rejects `high` with
+`Thinking effort high is not supported by vllm/qwen3.8-27b-ablit. Supported
+efforts: low, medium, xhigh`); this CLI forwards `--reasoning` verbatim to
+`completeSimple` and surfaces that rejection as a normal completion failure
+(exit 4), rather than silently clamping to a supported value.
+
 ## Build
 
 ```bash
@@ -285,36 +372,54 @@ bump implicitly via `npm update`.
 ## Acceptance
 
 `scripts/acceptance.sh` runs every check against real omp config/auth and
-real backends — no recording stand-ins, no mocks for (a)-(d); (e) is the
-pure-function unit-test suite for every api family with no live credentials
-on this machine (see "Supported api families" above):
+real backends — no recording stand-ins, no mocks for (a)-(e); (f) is the
+pure-function unit-test suite (arg parsing, transcript assembly, and every
+api family's payload injection, see "Supported api families" above):
 
-- (a) trivial 2-field schema vs `vllm/qwen3.8-27b-ablit`
-- (b) the real ~22KB `exophial.ops.typed_intake.proposal_or_escalate_schema()`
-  (imported live via `uv run`; falls back to a synthesized comparable-depth
-  schema if exophial isn't importable) vs `vllm/qwen3.8-27b-ablit`, run 5
-  times, reporting N/5 schema-valid AND how many of the 5 needed the
-  one-shot session-read continuation
-- (c) trivial schema vs `anthropic/claude-sonnet-5` (best-effort; depends on
-  the auth broker being reachable)
-- (d) `--session` produces a real session `.jsonl` under
-  `~/.omp/agent/sessions/<cwd-slug>/` whose header `id` matches the reported
-  session id
-- (e) `bun test src` - `src/payload-injection.test.ts`'s per-api wire-shape
+- (a) the real ~22KB `exophial.ops.derivation_schema.proposal_or_escalate_schema()`
+  (imported live via `uv run`, falling back to the installed exophial
+  interpreter, then to a synthesized comparable-depth schema if neither is
+  importable) vs `vllm/qwen3.8-27b-ablit`, run 5 times, reporting N/5
+  schema-valid AND how many of the 5 needed the one-shot session-read
+  continuation
+- (b) `--system-prompt` demonstrably changes output vs `vllm/qwen3.8-27b-ablit`:
+  a system prompt forcing `answer` to the literal string `SYSTEMOK`, run
+  both with and without the flag, asserting the string appears only with it
+- (c) `--messages` carries a 3-turn transcript (user/assistant/user) vs
+  `vllm/qwen3.8-27b-ablit`, where the correct answer is a value only the
+  earlier assistant turn stated, plus a `--prompt`+`--messages` invocation
+  asserting it is rejected (exit 2)
+- (d) `--reasoning off` and `--reasoning high` (falling back to `xhigh` when
+  this model's own catalog entry rejects `high` — see "System prompt,
+  multi-turn transcripts, and reasoning effort" above) vs
+  `vllm/qwen3.8-27b-ablit`, both schema-valid, asserting the real wire
+  body's reasoning fields (logged via `onPayload`) actually differ between
+  the two
+- (e) `--system-prompt` vs `anthropic/claude-sonnet-5` (best-effort; depends
+  on the auth broker being reachable), asserting both schema-valid output
+  and the system prompt honored
+- (f) `bun test src` - `src/args.test.ts` (mutual exclusion, reasoning enum),
+  `src/transcript.test.ts` (message-array validation, system-prompt
+  composition), and `src/payload-injection.test.ts`'s per-api wire-shape
   assertions
+- (g) `--session` still produces a real session `.jsonl` under
+  `~/.omp/agent/sessions/<cwd-slug>/` whose header `id` matches the reported
+  session id (regression check for pre-existing behavior)
 
 ```bash
 npm run acceptance
 ```
 
-A real run against this machine's vLLM + Anthropic (2026-09-21) produced:
+A real run against this machine's vLLM + Anthropic (2026-09-22) produced:
 
 ```
-(a) PASS (exit 0, schema-valid object)
-(b) 5/5 schema-valid; 5/5 needed the one-shot session-read continuation
-(c) PASS (exit 0, schema-valid object)
-(d) PASS (file exists on disk, header id matches reported id)
-(e) 17 pass, 0 fail (23 expect() calls)
+(a) 5/5 schema-valid; 4/5 needed the one-shot session-read continuation
+(b) PASS (system prompt honored with the flag: {"answer":"SYSTEMOK"}; not honored without it: {"answer":"hello"})
+(c) PASS (transcript answer: {"answer":"FLAMINGO77"}; --prompt+--messages rejected, exit 2)
+(d) PASS (--reasoning off wire: {"chat_template_kwargs":{"enable_thinking":false}}; --reasoning xhigh wire: {"chat_template_kwargs":{"enable_thinking":true,"reasoning_effort":"xhigh"}} — --reasoning high itself correctly rejected: "Thinking effort high is not supported by vllm/qwen3.8-27b-ablit. Supported efforts: low, medium, xhigh")
+(e) PASS (exit 0, schema-valid, system prompt honored: {"answer":"SYSTEMOK"})
+(f) 52 pass, 0 fail (88 expect() calls)
+(g) PASS (file exists on disk, header id matches reported id)
 ```
 
 ## Exophial integration (exo-3904 / exo-c441 fix path)
@@ -326,12 +431,21 @@ A new `OmpStructuredCliTransport` in `exophial/llm_transport.py` would lower a
 bun /path/to/omp-structured/dist/cli.js \
   --model <provider>/<model> \
   --json-schema <schema-tmpfile-path> \
-  --prompt -                            # request.messages piped to stdin \
+  --messages <transcript-tmpfile-path>  # request.messages, the whole growing \
+                                         # discuss/Slack transcript, as a JSON \
+                                         # array of {role, content} \
+  [--system-prompt <system-tmpfile-path>]  # when request carries a system prompt \
+  [--reasoning <effort>]                # request.thinking_budget mapped to off/ \
+                                         # minimal/low/medium/high/xhigh/max \
   --cwd <request.cwd> \
   --timeout <request.timeout> \
   [--profile <profile>] \
   [--session --print-session-id]        # only when persist_session=True
 ```
+
+(`--prompt -` remains the single-user-message shortcut for any caller that
+only ever sends one turn — unchanged from before this transcript/system-
+prompt/reasoning widening.)
 
 reading the printed stdout line as `structured_output` directly (already
 schema-valid — no re-parsing a tool-call payload) and, when `--session` was
