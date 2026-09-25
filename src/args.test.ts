@@ -102,6 +102,41 @@ describe("--max-tokens", () => {
   });
 });
 
+describe("--temperature", () => {
+  test("omitted leaves temperature undefined (unset = not pinned)", () => {
+    expect(parseArgs(BASE).temperature).toBeUndefined();
+  });
+
+  test("zero is a valid pinned value (the deterministic-judge case), not treated as unset", () => {
+    expect(parseArgs([...BASE, "--temperature", "0"]).temperature).toBe(0);
+  });
+
+  test("a fractional value parses", () => {
+    expect(parseArgs([...BASE, "--temperature", "0.7"]).temperature).toBe(0.7);
+  });
+
+  test("negative and non-numeric values are rejected", () => {
+    expect(() => parseArgs([...BASE, "--temperature", "-0.1"])).toThrow(CliArgError);
+    expect(() => parseArgs([...BASE, "--temperature", "hot"])).toThrow(CliArgError);
+  });
+});
+
+describe("--seed", () => {
+  test("omitted leaves seed undefined", () => {
+    expect(parseArgs(BASE).seed).toBeUndefined();
+  });
+
+  test("a non-negative integer parses (including zero)", () => {
+    expect(parseArgs([...BASE, "--seed", "0"]).seed).toBe(0);
+    expect(parseArgs([...BASE, "--seed", "42"]).seed).toBe(42);
+  });
+
+  test("negative and non-integer values are rejected", () => {
+    expect(() => parseArgs([...BASE, "--seed", "-1"])).toThrow(CliArgError);
+    expect(() => parseArgs([...BASE, "--seed", "1.5"])).toThrow(CliArgError);
+  });
+});
+
 describe("existing flags still parse (no regression)", () => {
   test("--cwd, --profile, --session, --timeout, --print-session-id", () => {
     const args = parseArgs([

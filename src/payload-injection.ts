@@ -238,3 +238,214 @@ export function buildConstrainedOnPayload(api: string, schema: JsonSchema): Cons
   if (!inject) throw new UnsupportedApiError(api);
   return (payload: unknown) => (isJsonObject(payload) ? inject(payload, schema) : undefined);
 }
+
+// ─── pinned decoding: temperature + seed wire injection ──────────────────────
+//
+// Same mechanism and the same `KnownApi` discriminant as the structured-output
+// injectors above: omp's `SimpleStreamOptions` carries a cross-provider
+// `temperature` but NO `seed` for any family, and even `temperature` is dropped
+// by the anthropic provider for models that deprecated sampling params
+// (`compat.supportsSamplingParams === false`), so a caller pinning a judge's
+// decoding cannot rely on `SimpleStreamOptions`. Injecting both onto the exact
+// outgoing wire body via `onPayload` is the one mechanism that both reaches the
+// provider AND is inspectable on the wire. Where a family's request wire has no
+// seed field at all, {@link apiSupportsSeed} is false and the CLI fails loud
+// naming the provider rather than silently dropping the pin.
+
+/** Places a single numeric decoding field (`temperature`/`seed`) onto a wire body. */
+type NumberInjector = (payload: Record<string, unknown>, value: number) => Record<string, unknown>;
+
+/** The pinned decoding controls a caller can set. `undefined` means unset (not pinned). */
+export interface DecodingRequest {
+  temperature: number | undefined;
+  seed: number | undefined;
+}
+
+/** A pinned decoding control the resolved provider/model cannot honor. Thrown so the CLI fails loud (never sends an unpinned request). */
+export class UnhonorableDecodingError extends Error {
+  constructor(api: string, setting: "temperature" | "seed", reason: string) {
+    super(
+      `The resolved provider/model cannot honor a pinned --${setting} (api "${api}"): ${reason}. ` +
+        "Refusing to send the request: a pinned decoding setting silently dropped is not pinned " +
+        "(see docs and src/payload-injection.ts).",
+    );
+    this.name = "UnhonorableDecodingError";
+  }
+}
+
+function injectFlat(key: string): NumberInjector {
+  return (payload, value) => ({ ...payload, [key]: value });
+}
+
+/** Places `value` at `payload[outer][inner]`, preserving any existing sibling keys under `outer`. */
+function injectNested(outer: string, inner: string): NumberInjector {
+  return (payload, value) => {
+    const existing = isJsonObject(payload[outer]) ? payload[outer] : {};
+    return { ...payload, [outer]: { ...existing, [inner]: value } };
+  };
+}
+
+/** Places `value` at `payload[a][b][c]` (google-gemini-cli's `request.generationConfig.*` shape). */
+function injectNested2(a: string, b: string, c: string): NumberInjector {
+  return (payload, value) => {
+    const outer = isJsonObject(payload[a]) ? payload[a] : {};
+    const middle = isJsonObject(outer[b]) ? outer[b] : {};
+    return { ...payload, [a]: { ...outer, [b]: { ...middle, [c]: value } } };
+  };
+}
+
+/** Where each api family carries `temperature` on its wire body. Every supported api HAS a temperature field; whether a given MODEL still accepts it (anthropic/OpenAI models that deprecated sampling params) is `model.compat.supportsSamplingParams`, decided by the caller — see cli.ts. */
+const TEMPERATURE_INJECTORS: Record<string, NumberInjector> = {
+  "openai-completions": injectFlat("temperature"),
+  "anthropic-messages": injectFlat("temperature"),
+  "openai-responses": injectFlat("temperature"),
+  "openai-codex-responses": injectFlat("temperature"),
+  "azure-openai-responses": injectFlat("temperature"),
+  openrouter: injectFlat("temperature"),
+  "google-generative-ai": injectNested("config", "temperature"),
+  "google-vertex": injectNested("config", "temperature"),
+  "google-gemini-cli": injectNested2("request", "generationConfig", "temperature"),
+  "ollama-chat": injectNested("options", "temperature"),
+  "bedrock-converse-stream": injectNested("inferenceConfig", "temperature"),
+};
+
+/** Where each api family carries a sampling `seed`, or `null` when its request wire has no seed field. `openrouter` is `null` on purpose: its wire shape is chosen at runtime from `PI_OPENROUTER_RESPONSES` and the Responses shape has no seed, so a seed cannot be statically guaranteed to reach the provider — the honest choice is to fail loud rather than sometimes drop it. */
+const SEED_INJECTORS: Record<string, NumberInjector | null> = {
+  "openai-completions": injectFlat("seed"),
+  "anthropic-messages": null,
+  "openai-responses": null,
+  "openai-codex-responses": null,
+  "azure-openai-responses": null,
+  openrouter: null,
+  "google-generative-ai": injectNested("config", "seed"),
+  "google-vertex": injectNested("config", "seed"),
+  "google-gemini-cli": injectNested2("request", "generationConfig", "seed"),
+  "ollama-chat": injectNested("options", "seed"),
+  "bedrock-converse-stream": null,
+};
+
+/** True iff `api`'s request wire has a `temperature` field at all (every supported api does). */
+export function apiSupportsTemperature(api: string): boolean {
+  return api in TEMPERATURE_INJECTORS;
+}
+
+/** True iff `api`'s request wire has a `seed` field this CLI can inject onto. */
+export function apiSupportsSeed(api: string): boolean {
+  return SEED_INJECTORS[api] != null;
+}
+
+/**
+ * Build an `onPayload` hook that injects the pinned decoding controls onto the
+ * exact outgoing wire body for `api`. Throws {@link UnhonorableDecodingError}
+ * synchronously if a SET control has no wire field for this api, so the caller
+ * fails before any network request. Temperature's per-MODEL honorability
+ * (anthropic/OpenAI sampling-param deprecation) is the caller's check (cli.ts);
+ * this function only knows the api-level wire shape.
+ */
+export function buildDecodingOnPayload(api: string, decoding: DecodingRequest): ConstrainedOnPayload {
+  const steps: Array<(payload: Record<string, unknown>) => Record<string, unknown>> = [];
+  if (decoding.temperature !== undefined) {
+    const inject = TEMPERATURE_INJECTORS[api];
+    if (!inject) throw new UnhonorableDecodingError(api, "temperature", "this api has no temperature wire field");
+    const value = decoding.temperature;
+    steps.push(payload => inject(payload, value));
+  }
+  if (decoding.seed !== undefined) {
+    const inject = SEED_INJECTORS[api];
+    if (!inject) throw new UnhonorableDecodingError(api, "seed", "this api's request wire has no seed field");
+    const value = decoding.seed;
+    steps.push(payload => inject(payload, value));
+  }
+  return (payload: unknown) => {
+    if (!isJsonObject(payload)) return undefined;
+    let body = payload;
+    for (const step of steps) body = step(body);
+    return body;
+  };
+}
+
+// ─── truthful output budget: read the number actually on the wire ────────────
+
+/** The resolved output-token budget as it actually appears on the outgoing wire body — the real number sent, including any provider-SDK fallback/clamp the caller never set (e.g. anthropic's OAuth clamp to CLAUDE_CODE_MAX_OUTPUT_TOKENS). `value` is `undefined` only when the wire genuinely carries no output cap. `field` names the wire key inspected. */
+export interface WireBudget {
+  value: number | undefined;
+  field: string;
+}
+
+function readNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function nested(payload: Record<string, unknown>, outer: string, inner: string): number | undefined {
+  return isJsonObject(payload[outer]) ? readNumber(payload[outer][inner]) : undefined;
+}
+
+/** Read the output-token budget field from `payload` for `api`. This is the ground-truth "budget actually sent": whatever the SDK put on the wire after its own resolution, so "source=unset" can never hide a provider fallback cap. */
+export function readWireBudget(api: string, payload: Record<string, unknown>): WireBudget {
+  switch (api) {
+    case "anthropic-messages":
+      return { value: readNumber(payload.max_tokens), field: "max_tokens" };
+    case "openai-completions":
+      return {
+        value: readNumber(payload.max_tokens) ?? readNumber(payload.max_completion_tokens),
+        field: "max_tokens/max_completion_tokens",
+      };
+    case "openai-responses":
+    case "openai-codex-responses":
+    case "azure-openai-responses":
+      return { value: readNumber(payload.max_output_tokens), field: "max_output_tokens" };
+    case "openrouter":
+      return "input" in payload
+        ? { value: readNumber(payload.max_output_tokens), field: "max_output_tokens" }
+        : {
+            value: readNumber(payload.max_tokens) ?? readNumber(payload.max_completion_tokens),
+            field: "max_tokens/max_completion_tokens",
+          };
+    case "google-generative-ai":
+    case "google-vertex":
+      return { value: nested(payload, "config", "maxOutputTokens"), field: "config.maxOutputTokens" };
+    case "google-gemini-cli": {
+      const request = isJsonObject(payload.request) ? payload.request : {};
+      return {
+        value: nested(request, "generationConfig", "maxOutputTokens"),
+        field: "request.generationConfig.maxOutputTokens",
+      };
+    }
+    case "ollama-chat":
+      return { value: nested(payload, "options", "num_predict"), field: "options.num_predict" };
+    case "bedrock-converse-stream":
+      return { value: nested(payload, "inferenceConfig", "maxTokens"), field: "inferenceConfig.maxTokens" };
+    default:
+      return { value: undefined, field: "(unknown api)" };
+  }
+}
+
+/** The pinned decoding controls as they actually sit on the outgoing wire body for `api` — the symmetric read of {@link buildDecodingOnPayload}'s writes, so "the decoding reaching the provider" is inspectable (stderr log) rather than merely trusted. */
+export function readWireDecoding(api: string, payload: Record<string, unknown>): DecodingRequest {
+  switch (api) {
+    case "openai-completions":
+      return { temperature: readNumber(payload.temperature), seed: readNumber(payload.seed) };
+    case "anthropic-messages":
+    case "openai-responses":
+    case "openai-codex-responses":
+    case "azure-openai-responses":
+    case "openrouter":
+      return { temperature: readNumber(payload.temperature), seed: readNumber(payload.seed) };
+    case "google-generative-ai":
+    case "google-vertex":
+      return { temperature: nested(payload, "config", "temperature"), seed: nested(payload, "config", "seed") };
+    case "google-gemini-cli": {
+      const request = isJsonObject(payload.request) ? payload.request : {};
+      return {
+        temperature: nested(request, "generationConfig", "temperature"),
+        seed: nested(request, "generationConfig", "seed"),
+      };
+    }
+    case "ollama-chat":
+      return { temperature: nested(payload, "options", "temperature"), seed: nested(payload, "options", "seed") };
+    case "bedrock-converse-stream":
+      return { temperature: nested(payload, "inferenceConfig", "temperature"), seed: undefined };
+    default:
+      return { temperature: undefined, seed: undefined };
+  }
+}

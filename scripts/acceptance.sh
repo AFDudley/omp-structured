@@ -16,9 +16,13 @@
 #   (h) the output-token budget derives from the resolved model's declared output limit: a
 #       reasoning-heavy request truncates (stopReason=length) under an explicit small
 #       --max-tokens but completes schema-valid under the derived default, vs vLLM
-# Exits non-zero if any REQUIRED check (a, b, c, d, f, g, h) fails; (e) is
-# best-effort and reported separately since it depends on network/auth
-# reachability outside this repo.
+#   (i) pinned decoding + truthful budget vs real Anthropic (exo-d6a; best-effort): --temperature
+#       and --seed each fail loud (exit 6) naming the provider when the resolved model cannot honor
+#       them (sonnet-5 deprecated temperature; anthropic-messages has no seed), and the same request
+#       without the flags logs the REAL wire output budget (the OAuth clamp), not just the requested one
+# Exits non-zero if any REQUIRED check (a, b, c, d, f, g, h) fails; (e) and (i) are
+#       best-effort and reported separately since they depend on network/auth
+#       reachability outside this repo.
 set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
@@ -303,12 +307,46 @@ else
   overall_pass=false
 fi
 echo
+echo "================================================================"
+echo "(i) pinned decoding + truthful budget vs anthropic/claude-sonnet-5 (best-effort; reachability-dependent) [exo-d6a]"
+echo "================================================================"
+# (i1/i2) A pinned control the resolved model cannot honor fails loud (exit 6),
+# naming the provider, BEFORE any request — never silently unpinned. sonnet-5
+# deprecated temperature (compat.supportsSamplingParams=false) and
+# anthropic-messages has no seed field.
+"$CLI" --model anthropic/claude-sonnet-5 --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --temperature 0 --cwd "$SCRATCH_CWD" >/dev/null 2>/tmp/omp-structured-i-temp.err
+i_temp_code=$?
+"$CLI" --model anthropic/claude-sonnet-5 --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --seed 42 --cwd "$SCRATCH_CWD" >/dev/null 2>/tmp/omp-structured-i-seed.err
+i_seed_code=$?
+echo "--temperature 0: exit=$i_temp_code (expect 6); $(grep -i 'cannot be honored' /tmp/omp-structured-i-temp.err | tail -1)"
+echo "--seed 42:       exit=$i_seed_code (expect 6); $(grep -i 'cannot be honored' /tmp/omp-structured-i-seed.err | tail -1)"
+# (i3) the same request WITHOUT the flags: the authoritative wire budget names
+# the real number sent (the anthropic OAuth clamp to CLAUDE_CODE_MAX_OUTPUT_TOKENS),
+# distinct from the requested model.maxTokens — the number the pre-fix single log hid.
+i_budget_ok=false
+if "$CLI" --model anthropic/claude-sonnet-5 --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --reasoning off --cwd "$SCRATCH_CWD" >/dev/null 2>/tmp/omp-structured-i-budget.err; then
+  i_req_line=$(grep "requested output budget" /tmp/omp-structured-i-budget.err | tail -1)
+  i_wire_line=$(grep "wire output budget" /tmp/omp-structured-i-budget.err | tail -1)
+  echo "  $i_req_line"
+  echo "  $i_wire_line"
+  [ -n "$i_wire_line" ] && i_budget_ok=true
+else
+  echo "  (budget run: anthropic not reachable — skipped)"
+fi
+if [ "$i_temp_code" -eq 6 ] && [ "$i_seed_code" -eq 6 ] && $i_budget_ok; then
+  echo "(i) RESULT: PASS (both pins fail loud naming the provider; wire budget reports the real number sent)"
+elif [ "$i_temp_code" -eq 6 ] && [ "$i_seed_code" -eq 6 ]; then
+  echo "(i) RESULT: partial (fail-loud checks passed; budget check skipped — anthropic unreachable). Best-effort, not counted."
+else
+  echo "(i) RESULT: best-effort not satisfied (anthropic catalog likely unreachable to resolve the model). Not counted."
+fi
+echo
 
 echo "================================================================"
 echo "SUMMARY"
 echo "================================================================"
 if $overall_pass; then
-  echo "All required checks (a, b, c, d, f, g, h) passed. See above for (e)."
+  echo "All required checks (a, b, c, d, f, g, h) passed. See above for (e) and (i)."
   exit 0
 else
   echo "At least one required check FAILED. See above."

@@ -255,6 +255,13 @@ Options:
                              SimpleStreamOptions.maxTokens verbatim. Default: the resolved
                              model's own declared output limit (model.maxTokens from the omp
                              catalog). Pass this to override that default.
+  --temperature <t>          Pinned sampling temperature (a finite number >= 0), injected onto the
+                             provider's own wire body. Fails loud (exit 6) when the resolved
+                             provider/model cannot honor it (a model that deprecated sampling
+                             parameters) rather than silently sending an unpinned request.
+  --seed <n>                 Pinned sampling seed (a non-negative integer), injected onto the
+                             provider's own wire body for api families whose API has a seed field.
+                             Fails loud (exit 6) naming the provider when the api has no seed.
   --print-session-id         With --session, also emit a stable "SESSION_ID=<id>" line on stderr
 ```
 
@@ -262,7 +269,8 @@ Stdout carries exactly one line: the schema-valid JSON object. Everything
 else — progress, retries, the session id/path — goes to stderr. Exit 0 on a
 schema-valid object; non-zero with a specific stderr message otherwise
 (argument error: 2, unsupported provider API: 3, completion/model failure: 4,
-schema validation failure: 5).
+schema validation failure: 5, a pinned decoding control the resolved
+provider/model cannot honor: 6).
 
 ```bash
 echo '{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}' \
@@ -377,8 +385,62 @@ reasoning trace and the schema-constrained answer both; the same
 reasoning-heavy request that truncated under the old constant now completes
 schema-valid. `scripts/acceptance.sh` check (h) is exactly that discriminating
 pair: `--max-tokens 4096` truncates (`stopReason=length`, exit 4) while the
-model-derived default completes. Every completion logs its resolved budget and
-source to stderr (`[omp-structured] maxTokens=<n> (source=...)`).
+model-derived default completes.
+
+**The budget is reported truthfully from the actual outgoing wire body, not
+from what the CLI requested.** `--max-tokens ?? model.maxTokens` is only what
+this CLI ASKS the SDK for; the provider layer may clamp it underneath. On the
+anthropic auth-broker (OAuth) route, `providers/anthropic.ts` clamps
+`max_tokens` to `Math.min(CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000, model.maxTokens)`
+— so `anthropic/claude-sonnet-5`, whose catalog `maxTokens` is 128000, actually
+sends `max_tokens: 64000` on the wire. Reporting only the requested number
+(128000, or worse, `source=unset`) would hide that finite cap. So every
+completion logs BOTH lines to stderr: the request
+(`[omp-structured] requested output budget: maxTokens=<n> (source=...)`) and,
+authoritatively, the number actually on the wire read back through `onPayload`
+(`[omp-structured] wire output budget: <n> (field=<wireField>, api=<api>)`).
+The wire line is the real number sent; reading the wire is what makes
+`source=unset` unable to hide a provider-fallback cap.
+
+## Pinned decoding: temperature and seed
+
+**`--temperature` and `--seed` pin a call's sampling so a graded oracle's
+judge is a fixed grader, not a hidden live input** (exophial exo-d6a,
+`docs/ORACLES.md`'s live-dependency rule). omp's cross-provider
+`SimpleStreamOptions` carries a `temperature` but NO `seed` for any api family,
+and even `temperature` is dropped by the anthropic provider for models that
+deprecated sampling params (`compat.supportsSamplingParams === false`) — so
+neither control can be pinned through `SimpleStreamOptions` alone. Both are
+injected onto the exact outgoing wire body via the same `onPayload` mechanism
+the schema constraint uses (`src/payload-injection.ts`), keyed off the resolved
+`model.api`: flat `temperature`/`seed` for `openai-completions`, top-level
+`temperature` for `anthropic-messages`/the Responses family, `config.*` for
+Google, `options.*` for Ollama, `inferenceConfig.temperature` for Bedrock.
+They are logged from the real wire body
+(`[omp-structured] wire decoding fields: {...}`), so the pin reaching the
+provider is inspectable, not merely trusted.
+
+**A pinned control the resolved provider/model cannot honor fails loud (exit
+6), naming the provider — never silently dropped.** A pinned decoding setting
+that is silently discarded is not pinned. Temperature: the wire field exists on
+every family, but a model can reject it — `anthropic/claude-sonnet-5` and
+`anthropic/claude-opus-4-8` return `400 "temperature is deprecated for this
+model"`, surfaced statically via `compat.supportsSamplingParams`, as do OpenAI
+o-series/gpt-5. Seed: several api wires have no seed field at all
+(`anthropic-messages`, the Responses family, `bedrock-converse-stream`, and
+`openrouter` — whose runtime wire shape is chosen from `PI_OPENROUTER_RESPONSES`
+and the Responses shape has no seed). In every such case the CLI refuses before
+any network request rather than sending an unpinned one.
+
+A live discriminating check against `anthropic/claude-sonnet-5` (2026-09-25):
+`--temperature 0` and `--seed 42` each exit 6 naming `anthropic-messages`
+before any request; the same request WITHOUT the flags logs
+`requested output budget: maxTokens=128000 (source=model.maxTokens)` yet
+`wire output budget: 64000 (field=max_tokens, api=anthropic-messages)` — the
+real number sent, which the pre-fix single log hid. Determinism-when-honored
+(temperature 0 + seed reaching the `openai-completions` wire identically twice)
+is asserted by `src/payload-injection.test.ts`; no local vLLM live run is
+included here.
 
 ## Build
 
@@ -466,6 +528,8 @@ bun /path/to/omp-structured/dist/cli.js \
   [--system-prompt <system-tmpfile-path>]  # when request carries a system prompt \
   [--reasoning <effort>]                # request.thinking_budget mapped to off/ \
                                          # minimal/low/medium/high/xhigh/max \
+  [--temperature <t>]                   # request.temperature (grader.decoding pin) \
+  [--seed <n>]                          # request.seed (grader.decoding pin) \
   --cwd <request.cwd> \
   --timeout <request.timeout> \
   [--profile <profile>] \

@@ -20,6 +20,8 @@ export interface CliArgs {
   session: boolean;
   timeoutSeconds: number;
   maxTokens: number | undefined;
+  temperature: number | undefined;
+  seed: number | undefined;
   printSessionId: boolean;
 }
 
@@ -53,6 +55,14 @@ const USAGE = [
   "                             SimpleStreamOptions.maxTokens verbatim. Default: the resolved",
   "                             model's own declared output limit (model.maxTokens from the omp",
   "                             catalog); pass this to override it.",
+  "  --temperature <t>          Pinned sampling temperature (a finite number >= 0), injected onto the",
+  "                             provider's own wire body (see src/payload-injection.ts). Fails loud",
+  "                             (exit 6) when the resolved provider/model cannot honor it (e.g. an",
+  "                             anthropic model that deprecated sampling params) rather than silently",
+  "                             sending an unpinned request.",
+  "  --seed <n>                 Pinned sampling seed (a non-negative integer), injected onto the",
+  "                             provider's own wire body for api families whose API has a seed field.",
+  "                             Fails loud (exit 6) naming the provider when the api has no seed.",
   "  --print-session-id         With --session, also emit a stable \"SESSION_ID=<id>\" line on stderr",
   "  -h, --help                 Print this message and exit 0",
   "",
@@ -73,6 +83,8 @@ export function parseArgs(argv: readonly string[]): CliArgs {
   let session = false;
   let timeoutSeconds = 120;
   let maxTokens: number | undefined;
+  let temperature: number | undefined;
+  let seed: number | undefined;
   let printSessionId = false;
 
   for (let i = 0; i < argv.length; i++) {
@@ -119,6 +131,12 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       case "--max-tokens":
         maxTokens = requirePositiveInt(requireValue(argv, ++i, "--max-tokens"), "--max-tokens");
         break;
+      case "--temperature":
+        temperature = requireNonNegativeFloat(requireValue(argv, ++i, "--temperature"), "--temperature");
+        break;
+      case "--seed":
+        seed = requireNonNegativeInt(requireValue(argv, ++i, "--seed"), "--seed");
+        break;
       case "--print-session-id":
         printSessionId = true;
         break;
@@ -145,6 +163,8 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     session,
     timeoutSeconds,
     maxTokens,
+    temperature,
+    seed,
     printSessionId,
   };
 }
@@ -158,6 +178,18 @@ function requireValue(argv: readonly string[], index: number, flag: string): str
 function requirePositiveInt(value: string, flag: string): number {
   const n = Number(value);
   if (!Number.isInteger(n) || n <= 0) throw new CliArgError(`${flag} must be a positive integer, got "${value}"`);
+  return n;
+}
+
+function requireNonNegativeInt(value: string, flag: string): number {
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) throw new CliArgError(`${flag} must be a non-negative integer, got "${value}"`);
+  return n;
+}
+
+function requireNonNegativeFloat(value: string, flag: string): number {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n < 0) throw new CliArgError(`${flag} must be a finite number >= 0, got "${value}"`);
   return n;
 }
 

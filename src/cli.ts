@@ -27,7 +27,17 @@ import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type { AssistantMessage, Context, Message, UserMessage } from "@oh-my-pi/pi-ai/types";
 import { CliArgError, type CliArgs, parseArgs, type ReasoningEffort } from "./args.js";
 import { isStdinRequested, readPathOrStdin } from "./io.js";
-import { buildConstrainedOnPayload, type ConstrainedOnPayload, type JsonSchema, UnsupportedApiError } from "./payload-injection.js";
+import {
+  apiSupportsSeed,
+  apiSupportsTemperature,
+  buildConstrainedOnPayload,
+  buildDecodingOnPayload,
+  type ConstrainedOnPayload,
+  type JsonSchema,
+  readWireBudget,
+  readWireDecoding,
+  UnsupportedApiError,
+} from "./payload-injection.js";
 import {
   forceReasoningOffOnWire,
   isAnswerlessStop,
@@ -136,6 +146,34 @@ function logReasoningWireFields(payload: Record<string, unknown>): void {
   }
 }
 
+/** api families where a model can DEPRECATE sampling params (temperature) — the wire has the field, but a given model may reject it, signalled by `model.compat.supportsSamplingParams`. For every other family the field is unconditionally honored. Mirrors `@oh-my-pi/pi-catalog`'s `supports-sampling-params` compat axis, which is wired only for the OpenAI families + anthropic. */
+const SAMPLING_GATED_APIS: Record<string, true> = {
+  "openai-completions": true,
+  "openai-responses": true,
+  "openai-codex-responses": true,
+  "azure-openai-responses": true,
+  openrouter: true,
+  "anthropic-messages": true,
+};
+
+/** Non-mutating stderr log of the pinned decoding controls as they actually sit on the outgoing wire body, so `--temperature`/`--seed`'s effect on the request reaching the provider is inspectable, not merely trusted (mirrors logReasoningWireFields). */
+function logDecodingWireFields(api: string, payload: Record<string, unknown>): void {
+  const wire = readWireDecoding(api, payload);
+  const fields: Record<string, number> = {};
+  if (wire.temperature !== undefined) fields.temperature = wire.temperature;
+  if (wire.seed !== undefined) fields.seed = wire.seed;
+  if (Object.keys(fields).length > 0) {
+    process.stderr.write(`[omp-structured] wire decoding fields: ${JSON.stringify(fields)}\n`);
+  }
+}
+
+/** Non-mutating stderr log of the output-token budget ACTUALLY on the wire — the real number sent, including any provider-SDK fallback/clamp the caller never set. This is the authoritative budget report: reading the wire is what makes "source=unset" unable to hide a provider cap (e.g. anthropic's OAuth clamp to 64000 while model.maxTokens=128000). */
+function logWireBudget(api: string, payload: Record<string, unknown>): void {
+  const budget = readWireBudget(api, payload);
+  const shown = budget.value !== undefined ? String(budget.value) : "absent (no output cap on the wire)";
+  process.stderr.write(`[omp-structured] wire output budget: ${shown} (field=${budget.field}, api=${api})\n`);
+}
+
 /** Maps --reasoning onto completeSimple's SimpleStreamOptions. "off" -> disableReasoning (there is no Effort member for "off" - see args.ts); undefined (flag absent) preserves this CLI's pre-existing default of Effort.Medium for reasoning-capable models; every other value is a verified Effort enum member, forwarded as-is. */
 function resolveReasoningOptions(reasoning: ReasoningEffort | undefined, modelReasons: boolean): { reasoning: Effort | undefined; disableReasoning: boolean | undefined } {
   if (!modelReasons) return { reasoning: undefined, disableReasoning: undefined };
@@ -190,6 +228,43 @@ async function main(): Promise<void> {
   }
   const { reasoning, disableReasoning } = resolveReasoningOptions(args.reasoning, Boolean(model.reasoning));
 
+  // Pinned decoding (--temperature/--seed). Fail loud, BEFORE any network
+  // request, if the resolved provider/model cannot honor a SET control — a
+  // pinned decoding setting silently dropped is not pinned (docs/ORACLES.md's
+  // "a pinned judge is a fixed grader"). Temperature's wire field exists on
+  // every family, but a model can DEPRECATE it (anthropic sonnet-5, OpenAI
+  // o-series/gpt-5): `compat.supportsSamplingParams` is that per-model signal
+  // for the gated families. Seed has no wire field at all on several apis.
+  const samplingParamsHonored =
+    model.compat != null &&
+    "supportsSamplingParams" in model.compat &&
+    model.compat.supportsSamplingParams === true;
+  const temperatureHonorable =
+    args.temperature === undefined ||
+    (apiSupportsTemperature(model.api) &&
+      (SAMPLING_GATED_APIS[model.api] ? samplingParamsHonored : true));
+  if (!temperatureHonorable) {
+    fail(
+      `--temperature ${args.temperature} cannot be honored by "${args.model}" (api "${model.api}"): ` +
+        "this model deprecated sampling parameters (compat.supportsSamplingParams=false), so the provider " +
+        "rejects a temperature. Refusing to send an unpinned request " +
+        "(a pinned decoding setting silently dropped is not pinned).",
+      6,
+    );
+  }
+  if (args.seed !== undefined && !apiSupportsSeed(model.api)) {
+    fail(
+      `--seed ${args.seed} cannot be honored by "${args.model}" (api "${model.api}"): ` +
+        "this provider's API has no seed parameter. Refusing to send an unpinned request " +
+        "(a pinned decoding setting silently dropped is not pinned).",
+      6,
+    );
+  }
+  const decodingOnPayload = buildDecodingOnPayload(model.api, {
+    temperature: args.temperature,
+    seed: args.seed,
+  });
+
   // Composes the schema constraint with a non-mutating wire-level log of
   // every reasoning-related field actually present on the outgoing payload,
   // so --reasoning's effect is independently inspectable on stderr (see
@@ -203,9 +278,12 @@ async function main(): Promise<void> {
   // continuation's forced-off path already had to work around).
   const onPayload: ConstrainedOnPayload = payload => {
     const afterSchema = baseOnPayload(payload);
-    const forcedOff = disableReasoning && afterSchema ? forceReasoningOffOnWire(afterSchema) : afterSchema;
+    const afterDecoding = afterSchema ? decodingOnPayload(afterSchema) : afterSchema;
+    const forcedOff = disableReasoning && afterDecoding ? forceReasoningOffOnWire(afterDecoding) : afterDecoding;
     const wireBody = (forcedOff ?? payload) as Record<string, unknown>;
     logReasoningWireFields(wireBody);
+    logDecodingWireFields(model.api, wireBody);
+    logWireBudget(model.api, wireBody);
     return forcedOff;
   };
 
@@ -251,17 +329,19 @@ async function main(): Promise<void> {
   let sessionManager: SessionManagerHandle | undefined;
   let result: AssistantMessage | undefined;
   try {
-    // Output-token budget. Derived from the resolved model's own declared
-    // output limit (`model.maxTokens` from the omp catalog), which for a
-    // mandatory-reasoning local model already covers thinking + the final
-    // answer; `--max-tokens` overrides it. No hard-coded constant: a fixed
-    // 4096 total cap was exhausted by qwen's own <think> segment before it
-    // reached the JSON answer (stopReason=length). `undefined` (neither flag
-    // nor a catalog limit) lets the provider apply its own cap, exactly as
-    // omp's own `options.maxTokens ?? model.maxTokens` fallback does.
+    // Output-token budget REQUESTED of the SDK: the resolved model's own
+    // declared output limit (`model.maxTokens` from the omp catalog), which
+    // for a mandatory-reasoning local model already covers thinking + the
+    // final answer; `--max-tokens` overrides it. No hard-coded constant: a
+    // fixed 4096 total cap was exhausted by qwen's own <think> segment before
+    // it reached the JSON answer (stopReason=length). This is only what we ASK
+    // for — the provider SDK may clamp it (e.g. anthropic's OAuth clamp to
+    // 64000 while model.maxTokens=128000). The AUTHORITATIVE, truthful budget
+    // (`wire output budget`) is logged from the actual outgoing wire body in
+    // onPayload (logWireBudget), so "source=unset" can never hide a real cap.
     const maxTokens = args.maxTokens ?? model.maxTokens ?? undefined;
     process.stderr.write(
-      `[omp-structured] maxTokens=${maxTokens ?? "provider-default"} ` +
+      `[omp-structured] requested output budget: maxTokens=${maxTokens ?? "provider-default"} ` +
         `(source=${args.maxTokens !== undefined ? "--max-tokens" : model.maxTokens != null ? "model.maxTokens" : "unset"})\n`,
     );
     const completionOptions: Record<string, unknown> = {
