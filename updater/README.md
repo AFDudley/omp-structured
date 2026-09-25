@@ -7,8 +7,10 @@ no fallback path — a red gate means no publish.
 
 ## Flow (`run.sh`, one poll cycle)
 
-1. `check.sh` — refresh the maintained checkout to its upstream, compare the pinned
-   `@oh-my-pi/pi-ai` version to `npm view @oh-my-pi/pi-ai version`.
+1. `check.sh` — refresh the maintained checkout to the branch upstream itself declares as
+   default (`origin/HEAD`), forcing it there from any prior state (detached HEAD, another
+   branch, or a dirty tree), then compare the pinned `@oh-my-pi/pi-ai` version to
+   `npm view @oh-my-pi/pi-ai version`.
    - exit `0` up to date · exit `10` update available (prints the new version) · else error.
 2. `update.sh <version>` (only when an update exists):
    - task `omp --model vllm/qwen3.8-27b-ablit` to set every `@oh-my-pi/pi-*` pin, `npm install`,

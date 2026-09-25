@@ -273,13 +273,23 @@ Clues:
 
 Reason step by step through all constraints, then report the full solution: for every house give its position, color, nationality, drink, cigarette, and pet, and state who drinks water and who owns the zebra.
 EOF
-capped_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$REASONING_SCHEMA" --prompt "$REASONING_PROMPT" --max-tokens 4096 --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-h-capped.err)
+# Both runs generate a full reasoning trace; the default run may spend up to the
+# model's declared output limit. Derive each --timeout from its token budget so a
+# slow backend never races the CLI's 120s default and reports a false FAIL: a
+# conservative floor throughput plus fixed model-load/prompt headroom.
+H_FLOOR_TOKENS_PER_SEC=10                 # slow-hardware generation floor
+H_STARTUP_SECONDS=60                      # model load + prompt processing headroom
+H_CAPPED_BUDGET=4096                      # the explicit --max-tokens below (old constant)
+H_DEFAULT_BUDGET=16384                    # vllm/qwen3.8-27b-ablit's declared model.maxTokens
+capped_timeout=$(( H_STARTUP_SECONDS + H_CAPPED_BUDGET / H_FLOOR_TOKENS_PER_SEC ))
+default_timeout=$(( H_STARTUP_SECONDS + H_DEFAULT_BUDGET / H_FLOOR_TOKENS_PER_SEC ))
+capped_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$REASONING_SCHEMA" --prompt "$REASONING_PROMPT" --max-tokens 4096 --timeout "$capped_timeout" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-h-capped.err)
 capped_code=$?
 capped_budget=$(grep "maxTokens=" /tmp/omp-structured-h-capped.err | tail -1)
 echo "--max-tokens 4096 (old constant): exit=$capped_code"
 echo "                  $capped_budget"
 grep -q "stopReason=length" /tmp/omp-structured-h-capped.err && echo "                  truncated: stopReason=length" || echo "                  (no length truncation observed)"
-default_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$REASONING_SCHEMA" --prompt "$REASONING_PROMPT" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-h-default.err)
+default_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$REASONING_SCHEMA" --prompt "$REASONING_PROMPT" --timeout "$default_timeout" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-h-default.err)
 default_code=$?
 default_budget=$(grep "maxTokens=" /tmp/omp-structured-h-default.err | tail -1)
 echo "default (model-derived budget):   exit=$default_code stdout=${default_out:0:120}..."
