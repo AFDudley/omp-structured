@@ -19,6 +19,7 @@ export interface CliArgs {
   profile: string | undefined;
   session: boolean;
   timeoutSeconds: number;
+  maxTokens: number | undefined;
   printSessionId: boolean;
 }
 
@@ -48,6 +49,10 @@ const USAGE = [
   "  --session                  Write a real omp session .jsonl for this turn (default: --no-session)",
   "  --no-session                (default)",
   "  --timeout <seconds>        Abort the completion after N seconds (default: 120)",
+  "  --max-tokens <n>           Output-token budget for the completion. Maps to omp's",
+  "                             SimpleStreamOptions.maxTokens verbatim. Default: the resolved",
+  "                             model's own declared output limit (model.maxTokens from the omp",
+  "                             catalog); pass this to override it.",
   "  --print-session-id         With --session, also emit a stable \"SESSION_ID=<id>\" line on stderr",
   "  -h, --help                 Print this message and exit 0",
   "",
@@ -67,6 +72,7 @@ export function parseArgs(argv: readonly string[]): CliArgs {
   let profile: string | undefined;
   let session = false;
   let timeoutSeconds = 120;
+  let maxTokens: number | undefined;
   let printSessionId = false;
 
   for (let i = 0; i < argv.length; i++) {
@@ -110,6 +116,9 @@ export function parseArgs(argv: readonly string[]): CliArgs {
       case "--timeout":
         timeoutSeconds = requirePositiveInt(requireValue(argv, ++i, "--timeout"), "--timeout");
         break;
+      case "--max-tokens":
+        maxTokens = requirePositiveInt(requireValue(argv, ++i, "--max-tokens"), "--max-tokens");
+        break;
       case "--print-session-id":
         printSessionId = true;
         break;
@@ -135,6 +144,7 @@ export function parseArgs(argv: readonly string[]): CliArgs {
     profile,
     session,
     timeoutSeconds,
+    maxTokens,
     printSessionId,
   };
 }

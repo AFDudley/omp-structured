@@ -251,6 +251,10 @@ Options:
   --session                  Write a real omp session .jsonl for this turn (default: --no-session)
   --no-session                (default)
   --timeout <seconds>        Abort the completion after N seconds (default: 120)
+  --max-tokens <n>           Output-token budget for the completion, mapped to omp's
+                             SimpleStreamOptions.maxTokens verbatim. Default: the resolved
+                             model's own declared output limit (model.maxTokens from the omp
+                             catalog). Pass this to override that default.
   --print-session-id         With --session, also emit a stable "SESSION_ID=<id>" line on stderr
 ```
 
@@ -350,6 +354,31 @@ accepts — `vllm/qwen3.8-27b-ablit`, on this machine, accepts only
 efforts: low, medium, xhigh`); this CLI forwards `--reasoning` verbatim to
 `completeSimple` and surfaces that rejection as a normal completion failure
 (exit 4), rather than silently clamping to a supported value.
+
+## Output-token budget
+
+**The completion's output-token budget derives from the resolved model's own
+declared output limit — `model.maxTokens` from the omp catalog — not a
+hard-coded constant.** `--max-tokens <n>` overrides it and is forwarded to
+`SimpleStreamOptions.maxTokens` verbatim, exactly as omp's own
+`options.maxTokens ?? model.maxTokens` fallback resolves it (see
+`@oh-my-pi/pi-ai/stream.ts`'s `mapOptionsForApi`). When neither the flag nor a
+catalog limit is present the option is left unset and the provider applies its
+own cap.
+
+This replaced a fixed `maxTokens: 4096`. On `openai-completions`-family
+backends (this machine's local `vllm/qwen3.8-27b-ablit`) that wire field is
+the **total** output cap — thinking tokens included — so a mandatory-reasoning
+model spent the whole 4096 inside its own `<think>` segment and the turn ended
+`stopReason: "length"` before it ever emitted the final JSON, at every
+reasoning effort. `vllm/qwen3.8-27b-ablit`'s catalog entry declares
+`maxTokens: 16384` (`~/.omp/agent/models.yml`), which leaves room for the
+reasoning trace and the schema-constrained answer both; the same
+reasoning-heavy request that truncated under the old constant now completes
+schema-valid. `scripts/acceptance.sh` check (h) is exactly that discriminating
+pair: `--max-tokens 4096` truncates (`stopReason=length`, exit 4) while the
+model-derived default completes. Every completion logs its resolved budget and
+source to stderr (`[omp-structured] maxTokens=<n> (source=...)`).
 
 ## Build
 

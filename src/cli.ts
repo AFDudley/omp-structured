@@ -251,9 +251,22 @@ async function main(): Promise<void> {
   let sessionManager: SessionManagerHandle | undefined;
   let result: AssistantMessage | undefined;
   try {
+    // Output-token budget. Derived from the resolved model's own declared
+    // output limit (`model.maxTokens` from the omp catalog), which for a
+    // mandatory-reasoning local model already covers thinking + the final
+    // answer; `--max-tokens` overrides it. No hard-coded constant: a fixed
+    // 4096 total cap was exhausted by qwen's own <think> segment before it
+    // reached the JSON answer (stopReason=length). `undefined` (neither flag
+    // nor a catalog limit) lets the provider apply its own cap, exactly as
+    // omp's own `options.maxTokens ?? model.maxTokens` fallback does.
+    const maxTokens = args.maxTokens ?? model.maxTokens ?? undefined;
+    process.stderr.write(
+      `[omp-structured] maxTokens=${maxTokens ?? "provider-default"} ` +
+        `(source=${args.maxTokens !== undefined ? "--max-tokens" : model.maxTokens != null ? "model.maxTokens" : "unset"})\n`,
+    );
     const completionOptions: Record<string, unknown> = {
       apiKey,
-      maxTokens: 4096,
+      maxTokens,
       signal: controller.signal,
       // "medium" measurably reduces answerless reasoning-only stops versus
       // omp's ambient "low" default for this local model (see README

@@ -86,6 +86,22 @@ describe("--reasoning enum", () => {
   });
 });
 
+describe("--max-tokens", () => {
+  test("omitted leaves maxTokens undefined (cli.ts derives it from the resolved model.maxTokens)", () => {
+    expect(parseArgs(BASE).maxTokens).toBeUndefined();
+  });
+
+  test("a positive integer is parsed as the override budget", () => {
+    expect(parseArgs([...BASE, "--max-tokens", "16384"]).maxTokens).toBe(16384);
+  });
+
+  test("zero and negative and non-integer values are rejected", () => {
+    expect(() => parseArgs([...BASE, "--max-tokens", "0"])).toThrow(CliArgError);
+    expect(() => parseArgs([...BASE, "--max-tokens", "-1"])).toThrow(CliArgError);
+    expect(() => parseArgs([...BASE, "--max-tokens", "1.5"])).toThrow(CliArgError);
+  });
+});
+
 describe("existing flags still parse (no regression)", () => {
   test("--cwd, --profile, --session, --timeout, --print-session-id", () => {
     const args = parseArgs([

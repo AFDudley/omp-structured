@@ -13,7 +13,10 @@
 #   (e) --system-prompt vs real Anthropic (best-effort; depends on the auth broker being reachable)
 #   (f) unit tests: arg parsing (mutual exclusion, reasoning enum) + transcript assembly (message-array validation) + per-api payload injection
 #   (g) --session still produces a real session .jsonl (regression check for pre-existing behavior)
-# Exits non-zero if any REQUIRED check (a, b, c, d, f, g) fails; (e) is
+#   (h) the output-token budget derives from the resolved model's declared output limit: a
+#       reasoning-heavy request truncates (stopReason=length) under an explicit small
+#       --max-tokens but completes schema-valid under the derived default, vs vLLM
+# Exits non-zero if any REQUIRED check (a, b, c, d, f, g, h) fails; (e) is
 # best-effort and reported separately since it depends on network/auth
 # reachability outside this repo.
 set -uo pipefail
@@ -31,7 +34,9 @@ LARGE_SCHEMA=$(mktemp)
 LARGE_PROMPT=$(mktemp)
 SYSTEM_PROMPT=$(mktemp)
 TRANSCRIPT=$(mktemp)
-trap 'rm -f "$TRIVIAL_SCHEMA" "$TRIVIAL_PROMPT" "$LARGE_SCHEMA" "$LARGE_PROMPT" "$SYSTEM_PROMPT" "$TRANSCRIPT"' EXIT
+REASONING_SCHEMA=$(mktemp)
+REASONING_PROMPT=$(mktemp)
+trap 'rm -f "$TRIVIAL_SCHEMA" "$TRIVIAL_PROMPT" "$LARGE_SCHEMA" "$LARGE_PROMPT" "$SYSTEM_PROMPT" "$TRANSCRIPT" "$REASONING_SCHEMA" "$REASONING_PROMPT"' EXIT
 
 cat > "$TRIVIAL_SCHEMA" << 'EOF'
 {"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}
@@ -232,12 +237,68 @@ else
   overall_pass=false
 fi
 echo
+echo "================================================================"
+echo "(h) output-token budget derives from the model's declared output limit; --max-tokens overrides it, vs vllm/qwen3.8-27b-ablit"
+echo "================================================================"
+# A reasoning-heavy request whose <think> segment alone exceeds a small total
+# output cap. Under an explicit tiny --max-tokens the whole budget is spent in
+# reasoning and the turn truncates (stopReason=length, exit 4); under the
+# derived default (model.maxTokens from the omp catalog) the same request has
+# room to finish and emits schema-valid JSON. This is the discriminating check
+# for the fix that replaced the hard-coded maxTokens:4096 with a model-derived
+# budget: the truncating cap is exactly the old constant.
+cat > "$REASONING_SCHEMA" << 'EOF'
+{"type":"object","additionalProperties":false,"properties":{"houses":{"type":"array","minItems":5,"maxItems":5,"items":{"type":"object","additionalProperties":false,"properties":{"position":{"type":"integer"},"color":{"type":"string"},"nationality":{"type":"string"},"drink":{"type":"string"},"cigarette":{"type":"string"},"pet":{"type":"string"}},"required":["position","color","nationality","drink","cigarette","pet"]}},"water_drinker":{"type":"string"},"zebra_owner":{"type":"string"}},"required":["houses","water_drinker","zebra_owner"]}
+EOF
+cat > "$REASONING_PROMPT" << 'EOF'
+Solve this classic logic puzzle completely and carefully, deducing every attribute of all five houses.
+
+There are five houses in a row, numbered 1 to 5 from left to right. Each house has a different color, and is occupied by a person of a different nationality, who drinks a different beverage, smokes a different brand of cigarette, and keeps a different pet.
+
+Clues:
+1. The Englishman lives in the red house.
+2. The Spaniard owns the dog.
+3. Coffee is drunk in the green house.
+4. The Ukrainian drinks tea.
+5. The green house is immediately to the right of the ivory house.
+6. The Old Gold smoker owns snails.
+7. Kools are smoked in the yellow house.
+8. Milk is drunk in the middle house.
+9. The Norwegian lives in the first house.
+10. The man who smokes Chesterfields lives next to the man with the fox.
+11. Kools are smoked in the house next to the house where the horse is kept.
+12. The Lucky Strike smoker drinks orange juice.
+13. The Japanese smokes Parliaments.
+14. The Norwegian lives next to the blue house.
+
+Reason step by step through all constraints, then report the full solution: for every house give its position, color, nationality, drink, cigarette, and pet, and state who drinks water and who owns the zebra.
+EOF
+capped_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$REASONING_SCHEMA" --prompt "$REASONING_PROMPT" --max-tokens 4096 --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-h-capped.err)
+capped_code=$?
+capped_budget=$(grep "maxTokens=" /tmp/omp-structured-h-capped.err | tail -1)
+echo "--max-tokens 4096 (old constant): exit=$capped_code"
+echo "                  $capped_budget"
+grep -q "stopReason=length" /tmp/omp-structured-h-capped.err && echo "                  truncated: stopReason=length" || echo "                  (no length truncation observed)"
+default_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$REASONING_SCHEMA" --prompt "$REASONING_PROMPT" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-h-default.err)
+default_code=$?
+default_budget=$(grep "maxTokens=" /tmp/omp-structured-h-default.err | tail -1)
+echo "default (model-derived budget):   exit=$default_code stdout=${default_out:0:120}..."
+echo "                  $default_budget"
+if [ $capped_code -ne 0 ] && grep -q "stopReason=length" /tmp/omp-structured-h-capped.err \
+   && [ $default_code -eq 0 ] && echo "$default_out" | grep -q '"zebra_owner"' \
+   && echo "$default_budget" | grep -q "source=model.maxTokens"; then
+  echo "RESULT: PASS (old 4096 cap truncates; model-derived default completes schema-valid)"
+else
+  echo "RESULT: FAIL"
+  overall_pass=false
+fi
+echo
 
 echo "================================================================"
 echo "SUMMARY"
 echo "================================================================"
 if $overall_pass; then
-  echo "All required checks (a, b, c, d, f, g) passed. See above for (e)."
+  echo "All required checks (a, b, c, d, f, g, h) passed. See above for (e)."
   exit 0
 else
   echo "At least one required check FAILED. See above."
