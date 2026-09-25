@@ -7,6 +7,14 @@ no fallback path — a red gate means no publish.
 
 ## Flow (`run.sh`, one poll cycle)
 
+`run.sh` is the timer's entry point. The installed copy under `bin/` is only a **bootstrap**:
+it refreshes the maintained checkout to upstream's tip (`ensure_checkout`) and then re-execs
+the checkout's own `updater/run.sh`. So the scripts the service actually runs — `check.sh`,
+`update.sh`, `config.sh` — are the checkout's, at upstream's tip; a change to any of them
+lands on the next timer cycle with no manual re-install. Only the bootstrap primitive itself
+(`bin/run.sh`'s handoff block and `config.sh`'s `ensure_checkout`) is frozen at install time,
+so a change to *that* is the one case that needs `updater/install.sh` re-run.
+
 1. `check.sh` — refresh the maintained checkout to the branch upstream itself declares as
    default (`origin/HEAD`), forcing it there from any prior state (detached HEAD, another
    branch, or a dirty tree), then compare the pinned `@oh-my-pi/pi-ai` version to
@@ -25,9 +33,10 @@ no fallback path — a red gate means no publish.
 bash updater/install.sh
 ```
 
-Copies the scripts to `~/.local/share/omp-structured-updater/bin`, installs a systemd `--user`
-service + daily timer, and enables it. The maintained checkout lives at
-`~/.local/share/omp-structured-updater/checkout`; run logs at `.../logs/`.
+Copies the scripts to `~/.local/share/omp-structured-updater/bin` as the bootstrap (see Flow),
+installs a systemd `--user` service + daily timer, and enables it. The maintained checkout lives
+at `~/.local/share/omp-structured-updater/checkout`; run logs at `.../logs/`. Re-running this is
+only needed to update the bootstrap itself; ordinary updater changes self-deploy from upstream.
 
 Override via env: `OMP_STRUCTURED_UPDATER_MODEL`, `OMP_STRUCTURED_UPDATE_MAX_TIME`,
 `OMP_STRUCTURED_UPDATER_STATE`.

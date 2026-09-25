@@ -25,3 +25,20 @@ log() { printf '%s [omp-structured-updater] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ
 pkg_pin() { # <package> -> version string from the checkout's package.json
   node -e 'const p=require(process.argv[1]+"/package.json");process.stdout.write(String(p.dependencies[process.argv[2]]||""))' "$CHECKOUT" "$1"
 }
+
+ensure_checkout() { # put CHECKOUT on upstream's declared default branch, from any prior state
+  if [ ! -d "$CHECKOUT/.git" ]; then
+    log "cloning $REPO_SLUG -> $CHECKOUT"
+    gh repo clone "$REPO_SLUG" "$CHECKOUT" -- --quiet
+  fi
+  cd "$CHECKOUT"
+  git fetch --quiet origin
+  # The maintained checkout's state is a function of upstream alone: derive the
+  # branch upstream itself declares as default and land on it from ANY prior HEAD
+  # (detached, another branch, or a dirty tree), never depending on a locally
+  # configured @{u} that a detached HEAD would leave unresolvable.
+  git remote set-head origin --auto >/dev/null
+  local default; default="$(git symbolic-ref --short refs/remotes/origin/HEAD)"  # e.g. origin/main
+  git checkout -f -B "${default#origin/}" --quiet "$default"
+  git clean -fd --quiet          # keep gitignored node_modules/ + dist/ across runs
+}
