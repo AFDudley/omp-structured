@@ -26,6 +26,7 @@ import { default as Ajv } from "ajv";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import type { AssistantMessage, Context, Message, UserMessage } from "@oh-my-pi/pi-ai/types";
 import { CliArgError, type CliArgs, parseArgs, type ReasoningEffort } from "./args.js";
+import { acquireRouterLease, releaseRouterLease, ROUTER_POOL_PREFIX, type RouterLease, RouterLeaseError } from "./router-lease.js";
 import { isStdinRequested, readPathOrStdin } from "./io.js";
 import {
   apiSupportsSeed,
@@ -204,6 +205,22 @@ async function main(): Promise<void> {
   if (args.profile) process.env.OMP_PROFILE = args.profile;
 
   const rawInputs = await readRawInputs(args);
+
+  // `--model pool/<name>`: the router picks the server and how it is run. The
+  // member's thinking level replaces --reasoning, because it is a property of
+  // that server (e.g. marks' Qwen3.6 lands work only with thinking off).
+  if (args.model.startsWith(ROUTER_POOL_PREFIX)) {
+    let lease: RouterLease;
+    try {
+      lease = await acquireRouterLease(args.model);
+    } catch (err) {
+      if (err instanceof RouterLeaseError) fail(`[omp-structured] ${err.message}`, 7);
+      throw err;
+    }
+    process.once("exit", () => releaseRouterLease(lease));
+    process.stderr.write(`[omp-structured] ${args.model} -> ${lease.model} thinking=${lease.thinking} (${lease.note})\n`);
+    args = { ...args, model: lease.model, reasoning: lease.thinking };
+  }
 
   // Deliberately dynamic: every omp SDK module transitively loads
   // @oh-my-pi/pi-utils/dirs, which reads OMP_PROFILE once at first import.

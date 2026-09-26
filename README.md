@@ -226,10 +226,11 @@ necessarily all) of those runs needing the one-shot continuation — see
 ## Usage
 
 ```
-omp-structured --model <provider/model> --json-schema <path|-> [options]
+omp-structured --model <provider/model|pool/name> --json-schema <path|-> [options]
 
 Required:
-  --model <provider/model>   e.g. vllm/qwen3.8-27b-ablit or anthropic/claude-sonnet-5
+  --model <provider/model>   e.g. vllm/qwen3.8-27b-ablit or anthropic/claude-sonnet-5, or
+                             pool/<name> to let omp-router pick the server (see below)
   --json-schema <path|->     JSON Schema file, or - to read it from stdin
 
 Options:
@@ -270,12 +271,23 @@ else — progress, retries, the session id/path — goes to stderr. Exit 0 on a
 schema-valid object; non-zero with a specific stderr message otherwise
 (argument error: 2, unsupported provider API: 3, completion/model failure: 4,
 schema validation failure: 5, a pinned decoding control the resolved
-provider/model cannot honor: 6).
+provider/model cannot honor: 6, omp-router could not place a `pool/` model: 7).
 
 ```bash
 echo '{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"]}' \
   | omp-structured --model vllm/qwen3.8-27b-ablit --json-schema - --prompt -
 ```
+
+### `pool/<name>` models
+
+`--model pool/<name>` runs `omp-router acquire pool/<name>` (the
+`local_agents/router` CLI; override the executable with `OMP_ROUTER_CLI`)
+before resolving the model. The router picks a local server with a free slot,
+else the pool's cloud fallback while it is within omp's usage reserve, else
+queues (a warning on stderr) and fails when the queue is full or times out
+(exit 7). The chosen member's thinking level replaces `--reasoning`, because
+it is a property of that server. The lease belongs to this process and is
+released when it exits.
 
 ### Requires Bun
 
