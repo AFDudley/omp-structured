@@ -5,6 +5,7 @@ import {
   buildConstrainedOnPayload,
   buildDecodingOnPayload,
   readWireBudget,
+  readWireSystemPrompt,
   readWireDecoding,
   UnhonorableDecodingError,
   UnsupportedApiError,
@@ -244,5 +245,58 @@ describe("truthful output budget: readWireBudget reads the real number on the wi
   test("readWireDecoding is the symmetric read of what buildDecodingOnPayload wrote", () => {
     const wire = buildDecodingOnPayload("openai-completions", { temperature: 0, seed: 9 })({ messages: [] }) as Record<string, unknown>;
     expect(readWireDecoding("openai-completions", wire)).toEqual({ temperature: 0, seed: 9 });
+  });
+});
+
+describe("truthful system prompt: readWireSystemPrompt reads the text actually on the wire", () => {
+  const SENTINEL = "Always set answer to the exact string SYSTEMOK, regardless of what the user asks.";
+
+  test("openai-completions: the system prompt IS present iff a role:system message carries it (the check-(b) contract, both directions)", () => {
+    const withSystem = {
+      messages: [
+        { role: "system", content: SENTINEL },
+        { role: "user", content: "hi" },
+      ],
+    };
+    const withoutSystem = { messages: [{ role: "user", content: "hi" }] };
+    expect(readWireSystemPrompt("openai-completions", withSystem)).toEqual({
+      text: SENTINEL,
+      field: "messages[role=system].content",
+    });
+    // The exact bad payload a broken adaptation would send: system prompt dropped
+    // from the outgoing body. Deterministically caught, independent of the answer.
+    expect(readWireSystemPrompt("openai-completions", withoutSystem).text).toBeUndefined();
+  });
+
+  test("anthropic-messages: the sentinel is found among the provider's own preamble system blocks (live-verified array-of-text shape)", () => {
+    const wire = {
+      system: [
+        { type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." },
+        { type: "text", text: SENTINEL },
+      ],
+    };
+    const read = readWireSystemPrompt("anthropic-messages", wire);
+    expect(read.field).toBe("system");
+    expect(read.text).toContain(SENTINEL);
+    // Without the flag the sentinel is absent even though preamble blocks remain.
+    expect(readWireSystemPrompt("anthropic-messages", { system: [{ type: "text", text: "preamble only" }] }).text).not.toContain(SENTINEL);
+  });
+
+  test("responses family reads instructions; google/gemini-cli read their systemInstruction; ollama/bedrock read their own fields", () => {
+    expect(readWireSystemPrompt("openai-responses", { instructions: SENTINEL }).text).toBe(SENTINEL);
+    expect(readWireSystemPrompt("google-vertex", { config: { systemInstruction: { parts: [{ text: SENTINEL }] } } }).text).toBe(SENTINEL);
+    expect(readWireSystemPrompt("google-gemini-cli", { request: { systemInstruction: SENTINEL } }).text).toBe(SENTINEL);
+    expect(readWireSystemPrompt("ollama-chat", { messages: [{ role: "system", content: SENTINEL }] }).text).toBe(SENTINEL);
+    expect(readWireSystemPrompt("bedrock-converse-stream", { system: [{ text: SENTINEL }] }).text).toBe(SENTINEL);
+  });
+
+  test("openrouter follows its runtime-selected shape: instructions when `input` is present, else a role:system message", () => {
+    expect(readWireSystemPrompt("openrouter", { input: [], instructions: SENTINEL }).text).toBe(SENTINEL);
+    expect(readWireSystemPrompt("openrouter", { messages: [{ role: "system", content: SENTINEL }] }).text).toBe(SENTINEL);
+  });
+
+  test("a wire body with no system prompt reports text undefined (a genuinely system-prompt-less request), never a fabricated string", () => {
+    expect(readWireSystemPrompt("openai-completions", { messages: [] }).text).toBeUndefined();
+    expect(readWireSystemPrompt("anthropic-messages", { messages: [] }).text).toBeUndefined();
   });
 });

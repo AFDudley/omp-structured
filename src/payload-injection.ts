@@ -449,3 +449,94 @@ export function readWireDecoding(api: string, payload: Record<string, unknown>):
       return { temperature: undefined, seed: undefined };
   }
 }
+
+// ─── truthful system prompt: read the text actually on the wire ──────────────
+//
+// The symmetric read of where `completeSimple` places `Context.systemPrompt`
+// on each family's outgoing wire body. A model's ANSWER to a system prompt is
+// non-deterministic (the same request can be honored on one sample and ignored
+// on the next), so "did --system-prompt reach the provider?" cannot be decided
+// from the answer. The wire body CAN: the system prompt either sits on it or it
+// does not. openai-completions and anthropic-messages are live-verified (real
+// vLLM / real Anthropic); the remaining families follow the same documented
+// wire shapes the injectors/budget/decoding readers above already assume.
+
+/** The system prompt as it actually sits on the outgoing wire body for `api` — every wire segment carrying system text, joined by newlines. `text` is `undefined` only when the wire carries no system prompt at all. `field` names the wire location inspected. */
+export interface WireSystemPrompt {
+  text: string | undefined;
+  field: string;
+}
+
+/** Joins the text of every `system`-role entry in a chat `messages` array (openai-completions / ollama-chat wire shape). Handles both string content and content-part arrays. */
+function systemFromMessages(payload: Record<string, unknown>): string | undefined {
+  if (!Array.isArray(payload.messages)) return undefined;
+  const texts: string[] = [];
+  for (const entry of payload.messages) {
+    if (!isJsonObject(entry) || entry.role !== "system") continue;
+    if (typeof entry.content === "string") texts.push(entry.content);
+    else if (Array.isArray(entry.content)) {
+      for (const part of entry.content) if (isJsonObject(part) && typeof part.text === "string") texts.push(part.text);
+    }
+  }
+  return texts.length > 0 ? texts.join("\n") : undefined;
+}
+
+/** Reads a top-level `system` field that is either a bare string or an array of text blocks (anthropic-messages `system`, bedrock-converse-stream `system`). */
+function systemFromField(value: unknown): string | undefined {
+  if (typeof value === "string") return value.length > 0 ? value : undefined;
+  if (Array.isArray(value)) {
+    const texts: string[] = [];
+    for (const part of value) if (isJsonObject(part) && typeof part.text === "string") texts.push(part.text);
+    return texts.length > 0 ? texts.join("\n") : undefined;
+  }
+  return undefined;
+}
+
+/** Reads a `systemInstruction` that is either a bare string or a `Content` with a `parts` array (google-generative-ai/vertex `config.systemInstruction`, google-gemini-cli `request.systemInstruction`). */
+function systemFromInstruction(value: unknown): string | undefined {
+  if (typeof value === "string") return value.length > 0 ? value : undefined;
+  if (isJsonObject(value) && Array.isArray(value.parts)) {
+    const texts: string[] = [];
+    for (const part of value.parts) if (isJsonObject(part) && typeof part.text === "string") texts.push(part.text);
+    return texts.length > 0 ? texts.join("\n") : undefined;
+  }
+  return undefined;
+}
+
+/** Read the system prompt as it actually sits on the outgoing wire body for `api`. This is the ground-truth "system prompt actually sent", deterministic where a model's answer to it is not. A caller (e.g. cli.ts's onPayload log) can therefore prove --system-prompt reached the provider without depending on the model honoring it on any one sample. */
+export function readWireSystemPrompt(api: string, payload: Record<string, unknown>): WireSystemPrompt {
+  switch (api) {
+    case "openai-completions":
+    case "ollama-chat":
+      return { text: systemFromMessages(payload), field: "messages[role=system].content" };
+    case "anthropic-messages":
+    case "bedrock-converse-stream":
+      return { text: systemFromField(payload.system), field: "system" };
+    case "openai-responses":
+    case "openai-codex-responses":
+    case "azure-openai-responses":
+      return {
+        text: typeof payload.instructions === "string" && payload.instructions.length > 0 ? payload.instructions : undefined,
+        field: "instructions",
+      };
+    case "openrouter":
+      return "input" in payload
+        ? {
+            text: typeof payload.instructions === "string" && payload.instructions.length > 0 ? payload.instructions : undefined,
+            field: "instructions",
+          }
+        : { text: systemFromMessages(payload), field: "messages[role=system].content" };
+    case "google-generative-ai":
+    case "google-vertex":
+      return {
+        text: isJsonObject(payload.config) ? systemFromInstruction(payload.config.systemInstruction) : undefined,
+        field: "config.systemInstruction",
+      };
+    case "google-gemini-cli": {
+      const request = isJsonObject(payload.request) ? payload.request : {};
+      return { text: systemFromInstruction(request.systemInstruction), field: "request.systemInstruction" };
+    }
+    default:
+      return { text: undefined, field: "(unknown api)" };
+  }
+}

@@ -7,7 +7,9 @@
 #
 # Lettering matches the CLI's full input contract:
 #   (a) large-schema (~22KB exophial proposal_or_escalate_schema) reliability, x5, vs vLLM
-#   (b) --system-prompt demonstrably changes output, both directions, vs vLLM
+#   (b) --system-prompt reaches the real openai-completions wire body (a system message
+#       carrying the exact text, present with the flag / absent without), vs vLLM. This is
+#       the deterministic contract; the model's per-sample answer to the prompt is not.
 #   (c) --messages carries a multi-turn transcript, and --prompt+--messages is rejected, vs vLLM
 #   (d) --reasoning is honored and independently observable on the real wire body, vs vLLM
 #   (e) --system-prompt vs real Anthropic (best-effort; depends on the auth broker being reachable)
@@ -122,19 +124,39 @@ fi
 echo
 
 echo "================================================================"
-echo "(b) --system-prompt demonstrably changes output vs vllm/qwen3.8-27b-ablit (both directions)"
+echo "(b) --system-prompt reaches the real openai-completions wire vs vllm/qwen3.8-27b-ablit (both directions)"
 echo "================================================================"
-cat > "$SYSTEM_PROMPT" << 'EOF'
-Always set answer to the exact string SYSTEMOK, regardless of what the user asks.
+# The model's ANSWER to a system prompt is non-deterministic: qwen honors
+# "always answer SYSTEMOK" on most samples but can ignore it on any single one,
+# so an answer-equality check is a coin-flip, not a contract. The DETERMINISTIC
+# fact is the outgoing wire body: --system-prompt either places the system
+# message on it (openai-completions: a role:"system" entry carrying the exact
+# text) or it does not. cli.ts logs that wire location non-mutatingly
+# ("wire system prompt: {...}") from inside onPayload, so this check asserts on
+# the request that reached the provider, independent of how the model replied.
+SYSTEM_SENTINEL="Always set answer to the exact string SYSTEMOK, regardless of what the user asks."
+cat > "$SYSTEM_PROMPT" << EOF
+$SYSTEM_SENTINEL
 EOF
 with_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --system-prompt "$SYSTEM_PROMPT" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-b-with.err)
 with_code=$?
 without_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-b-without.err)
 without_code=$?
+with_wire=$(grep "wire system prompt" /tmp/omp-structured-b-with.err | tail -1)
+without_wire=$(grep "wire system prompt" /tmp/omp-structured-b-without.err | tail -1)
 echo "WITH --system-prompt:    exit=$with_code stdout=$with_out"
+echo "                  $with_wire"
 echo "WITHOUT --system-prompt: exit=$without_code stdout=$without_out"
-if [ $with_code -eq 0 ] && [ $without_code -eq 0 ] && echo "$with_out" | grep -q '"answer":"SYSTEMOK"' && ! echo "$without_out" | grep -q '"answer":"SYSTEMOK"'; then
-  echo "RESULT: PASS (system prompt honored with the flag, not honored without it)"
+echo "                  $without_wire"
+# WITH: both runs must complete, the system sentinel must sit on the wire, and
+# the field must be marked present. WITHOUT: the same wire location must NOT
+# carry the sentinel and must be marked absent. This fails on the exact bad
+# payload the 18.3.x adaptation could regress into — the system prompt dropped
+# from the outgoing body — and is immune to the model's per-sample answer.
+if [ $with_code -eq 0 ] && [ $without_code -eq 0 ] \
+  && echo "$with_wire" | grep -qF "$SYSTEM_SENTINEL" && echo "$with_wire" | grep -q '"present":true' \
+  && ! echo "$without_wire" | grep -qF "$SYSTEM_SENTINEL" && echo "$without_wire" | grep -q '"present":false'; then
+  echo "RESULT: PASS (system prompt present on the wire with the flag, absent without it)"
 else
   echo "RESULT: FAIL"
   overall_pass=false

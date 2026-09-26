@@ -35,6 +35,7 @@ import {
   type ConstrainedOnPayload,
   type JsonSchema,
   readWireBudget,
+  readWireSystemPrompt,
   readWireDecoding,
   UnsupportedApiError,
 } from "./payload-injection.js";
@@ -174,6 +175,14 @@ function logWireBudget(api: string, payload: Record<string, unknown>): void {
   process.stderr.write(`[omp-structured] wire output budget: ${shown} (field=${budget.field}, api=${api})\n`);
 }
 
+/** Non-mutating stderr log of the system prompt ACTUALLY on the wire — the symmetric read of where completeSimple placed context.systemPrompt for this api. A model's ANSWER to a system prompt varies sample to sample, so it cannot prove --system-prompt reached the provider; the wire body can and does deterministically. Mirrors logReasoningWireFields/logDecodingWireFields/logWireBudget. */
+function logSystemPromptWireField(api: string, payload: Record<string, unknown>): void {
+  const { text, field } = readWireSystemPrompt(api, payload);
+  process.stderr.write(
+    `[omp-structured] wire system prompt: ${JSON.stringify({ field, present: text !== undefined, text: text ?? null })}\n`,
+  );
+}
+
 /** Maps --reasoning onto completeSimple's SimpleStreamOptions. "off" -> disableReasoning (there is no Effort member for "off" - see args.ts); undefined (flag absent) preserves this CLI's pre-existing default of Effort.Medium for reasoning-capable models; every other value is a verified Effort enum member, forwarded as-is. */
 function resolveReasoningOptions(reasoning: ReasoningEffort | undefined, modelReasons: boolean): { reasoning: Effort | undefined; disableReasoning: boolean | undefined } {
   if (!modelReasons) return { reasoning: undefined, disableReasoning: undefined };
@@ -284,6 +293,7 @@ async function main(): Promise<void> {
     logReasoningWireFields(wireBody);
     logDecodingWireFields(model.api, wireBody);
     logWireBudget(model.api, wireBody);
+    logSystemPromptWireField(model.api, wireBody);
     return forcedOff;
   };
 
