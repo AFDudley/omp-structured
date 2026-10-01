@@ -205,10 +205,10 @@ high_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$TRIVIAL_SCHEMA"
 high_code=$?
 high_level="high"
 if [ $high_code -ne 0 ] && grep -q "is not supported by" /tmp/omp-structured-d-high.err; then
-  echo "--reasoning high: exit=$high_code REJECTED by this model's own catalog entry ($(grep 'is not supported by' /tmp/omp-structured-d-high.err)); falling back to --reasoning xhigh"
-  high_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --reasoning xhigh --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-d-high.err)
+  echo "--reasoning high: exit=$high_code REJECTED by this model's own catalog entry ($(grep 'is not supported by' /tmp/omp-structured-d-high.err)); falling back to --reasoning medium"
+  high_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$TRIVIAL_SCHEMA" --prompt "$TRIVIAL_PROMPT" --reasoning medium --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-d-high.err)
   high_code=$?
-  high_level="xhigh"
+  high_level="medium"
 fi
 high_wire=$(grep "wire reasoning fields" /tmp/omp-structured-d-high.err | tail -1)
 echo "--reasoning $high_level: exit=$high_code stdout=$high_out"
