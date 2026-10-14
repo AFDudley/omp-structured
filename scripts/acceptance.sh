@@ -315,7 +315,7 @@ capped_budget=$(grep "maxTokens=" /tmp/omp-structured-h-capped.err | tail -1)
 echo "--max-tokens 4096 (old constant): exit=$capped_code"
 echo "                  $capped_budget"
 grep -q "stopReason=length" /tmp/omp-structured-h-capped.err && echo "                  truncated: stopReason=length" || echo "                  (no length truncation observed)"
-default_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$REASONING_SCHEMA" --prompt "$REASONING_PROMPT" --timeout "$default_timeout" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-h-default.err)
+default_out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$REASONING_SCHEMA" --prompt "$REASONING_PROMPT" --reasoning off --timeout "$default_timeout" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-h-default.err)
 default_code=$?
 default_budget=$(grep "maxTokens=" /tmp/omp-structured-h-default.err | tail -1)
 echo "default (model-derived budget):   exit=$default_code stdout=${default_out:0:120}..."
