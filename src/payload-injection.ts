@@ -100,6 +100,28 @@ export type ConstrainedOnPayload = (payload: unknown) => Record<string, unknown>
 export function isJsonObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+/** Recursively removes the JSON-Schema `format` keyword from `schema`. vLLM's guided-decoding
+ * backend (llguidance) treats a named `format` value as a registered named grammar and fails
+ * with "Unknown format: <name>" when the name is not in its builtin set (exo-3904). Stripping
+ * the keyword keeps the shape contract intact (type, properties, required, oneOf, etc.) while
+ * removing only the format-keyword metadata that vLLM cannot resolve. Used by the openai-completions
+ * injector (vLLM wire) where vLLM's wire does not need the format keyword.
+ */
+export function stripFormatKeywords(schema: JsonSchema): JsonSchema {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(schema)) {
+    if (k === "format") continue;
+    out[k] = stripNested(v);
+  }
+  return out;
+}
+
+function stripNested(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((e) => stripNested(e));
+  if (isJsonObject(value)) return stripFormatKeywords(value as JsonSchema);
+  return value;
+}
+
 
 /** `Api` values with no documented structured-output wire field (agentic/terminal transports, plus the SDK's own `mock` provider). */
 const UNSUPPORTED_APIS = ["cursor-agent", "gitlab-duo-agent", "devin-agent", "mock"] as const;
@@ -123,7 +145,7 @@ function injectOpenAICompletionsResponseFormat(payload: Record<string, unknown>,
     ...payload,
     response_format: {
       type: "json_schema",
-      json_schema: { name: RESPONSE_FORMAT_NAME, schema, strict: true },
+      json_schema: { name: RESPONSE_FORMAT_NAME, schema: stripFormatKeywords(schema), strict: true },
     },
   };
 }
