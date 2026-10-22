@@ -7,6 +7,8 @@ import {
   readWireBudget,
   readWireSystemPrompt,
   readWireDecoding,
+  stripLookaroundFromPattern,
+  stripLookaroundPatterns,
   UnhonorableDecodingError,
   UnsupportedApiError,
 } from "./payload-injection.js";
@@ -27,6 +29,67 @@ describe("openai-completions (live-verified against real vLLM)", () => {
       messages: [],
       response_format: { type: "json_schema", json_schema: { name: "response", schema: SCHEMA, strict: true } },
     });
+  });
+});
+
+describe("stripLookaroundFromPattern: vLLM/llguidance cannot compile look-around in `pattern`", () => {
+  test("removes a chain of negative lookaheads immediately after `^`, leaving the consuming suffix untouched", () => {
+    expect(stripLookaroundFromPattern("^(?!.*/test/)(?!test/)(?!.*\\.t\\.sol$).+\\.sol$")).toBe("^.+\\.sol$");
+  });
+
+  test("leaves a pattern with no look-around completely unchanged", () => {
+    expect(stripLookaroundFromPattern("^[a-z0-9_]+\\.sol$")).toBe("^[a-z0-9_]+\\.sol$");
+  });
+
+  test("does not treat a `)` inside a character class as the look-around group's closer", () => {
+    expect(stripLookaroundFromPattern("^(?!.*[)])foo$")).toBe("^foo$");
+  });
+
+  test("strips a positive lookahead and a lookbehind, each independently", () => {
+    expect(stripLookaroundFromPattern("^(?=abc).*$")).toBe("^.*$");
+    expect(stripLookaroundFromPattern("^.*(?<=abc)$")).toBe("^.*$");
+    expect(stripLookaroundFromPattern("^(?<!x).*$")).toBe("^.*$");
+  });
+});
+
+describe("stripLookaroundPatterns: recurses through a schema, touching only `pattern` string values", () => {
+  test("strips a nested property's pattern but leaves every other keyword (including a sibling format) untouched", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        path: { type: "string", pattern: "^(?!.*/test/).+\\.sol$", format: "uri" },
+        name: { type: "string" },
+      },
+    };
+    expect(stripLookaroundPatterns(schema)).toEqual({
+      type: "object",
+      properties: {
+        path: { type: "string", pattern: "^.+\\.sol$", format: "uri" },
+        name: { type: "string" },
+      },
+    });
+  });
+
+  test("does not mutate the input schema object", () => {
+    const schema = { type: "string", pattern: "^(?!test).+$" };
+    const snapshot = JSON.parse(JSON.stringify(schema));
+    stripLookaroundPatterns(schema);
+    expect(schema).toEqual(snapshot);
+  });
+});
+
+describe("openai-completions wire carries a look-around-free pattern while the caller's schema object is unmodified", () => {
+  test("buildConstrainedOnPayload strips look-around from `pattern` on the wire but leaves the input schema intact", () => {
+    const schemaWithLookaround = {
+      type: "object",
+      properties: { path: { type: "string", pattern: "^(?!.*/test/).+\\.sol$" } },
+    };
+    const onPayload = buildConstrainedOnPayload("openai-completions", schemaWithLookaround);
+    const result = onPayload({ model: "qwen3.8", messages: [] }) as {
+      response_format: { json_schema: { schema: { properties: { path: { pattern: string } } } } };
+    };
+    expect(result.response_format.json_schema.schema.properties.path.pattern).toBe("^.+\\.sol$");
+    expect(schemaWithLookaround.properties.path.pattern).toBe("^(?!.*/test/).+\\.sol$");
   });
 });
 

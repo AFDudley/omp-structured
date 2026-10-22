@@ -122,6 +122,121 @@ function stripNested(value: unknown): unknown {
   return value;
 }
 
+/** Strips look-ahead/look-behind assertion groups (`(?=...)`, `(?!...)`, `(?<=...)`, `(?<!...)`)
+ * out of a regex-pattern SOURCE string, leaving every other construct (character classes,
+ * nested non-look-around groups, quantifiers, anchors) untouched. vLLM's guided-decoding
+ * backend (llguidance) compiles `pattern` through the Rust `regex` crate, which refuses ANY
+ * look-around with "look-around, including look-ahead and look-behind, is not supported" -
+ * this is the `regex` crate's own documented design limitation (it guarantees linear-time
+ * matching, which look-around cannot preserve), not a version bug, so no llguidance/vLLM
+ * upgrade fixes it (see rust-lang/regex discussion #910).
+ *
+ * Stripping, not rewriting to an equivalent, is safe here because it is NOT the only check:
+ * cli.ts validates the model's eventual output against the UNMODIFIED `--json-schema` with Ajv
+ * (whose `pattern` keyword runs on Node's native RegExp, which DOES support look-around)
+ * before accepting it. Loosening only the WIRE grammar lets vLLM generate a candidate at all;
+ * any candidate the look-around would have forbidden still fails that Ajv validation (exit 5),
+ * exactly as a schema violation always has. Before this strip, a `pattern` with look-around
+ * made vLLM reject the WHOLE request with an HTTP 400, so every such request failed outright;
+ * stripping turns that into "some candidates fail post-hoc validation," which is strictly more
+ * coverage, never less.
+ */
+export function stripLookaroundFromPattern(pattern: string): string {
+  let out = "";
+  let i = 0;
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === "\\") {
+      out += pattern.slice(i, i + 2);
+      i += 2;
+      continue;
+    }
+    if (ch === "[") {
+      const end = findCharClassEnd(pattern, i);
+      out += pattern.slice(i, end);
+      i = end;
+      continue;
+    }
+    if (ch === "(" && /^\(\?<?[=!]/.test(pattern.slice(i, i + 4))) {
+      i = findGroupEnd(pattern, i);
+      continue;
+    }
+    out += ch;
+    i += 1;
+  }
+  return out;
+}
+
+/** `start` points at a regex character class's opening `[`; returns the index just past its
+ * matching unescaped `]`, treating a `]` immediately after `[` or `[^` as a literal member
+ * (the standard regex character-class convention) rather than the closer. */
+function findCharClassEnd(pattern: string, start: number): number {
+  let i = start + 1;
+  if (pattern[i] === "^") i += 1;
+  if (pattern[i] === "]") i += 1;
+  while (i < pattern.length) {
+    if (pattern[i] === "\\") {
+      i += 2;
+      continue;
+    }
+    if (pattern[i] === "]") return i + 1;
+    i += 1;
+  }
+  return i;
+}
+
+/** `start` points at the `(` of a `(?...)` group; returns the index just past its matching
+ * `)`, skipping over escapes and nested character classes/groups so an unescaped `)` inside
+ * either never ends the group early. */
+function findGroupEnd(pattern: string, start: number): number {
+  let depth = 0;
+  let i = start;
+  while (i < pattern.length) {
+    const ch = pattern[i];
+    if (ch === "\\") {
+      i += 2;
+      continue;
+    }
+    if (ch === "[") {
+      i = findCharClassEnd(pattern, i);
+      continue;
+    }
+    if (ch === "(") {
+      depth += 1;
+      i += 1;
+      continue;
+    }
+    if (ch === ")") {
+      depth -= 1;
+      i += 1;
+      if (depth === 0) return i;
+      continue;
+    }
+    i += 1;
+  }
+  return i;
+}
+
+/** Recursively applies {@link stripLookaroundFromPattern} to every `pattern` keyword in
+ * `schema`. Used by the openai-completions injector (vLLM wire) alongside
+ * {@link stripFormatKeywords}; see that function's doc comment for why stripping - rather than
+ * rewriting to an equivalent - cannot weaken the actual "never return a schema-violating
+ * output" contract.
+ */
+export function stripLookaroundPatterns(schema: JsonSchema): JsonSchema {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(schema)) {
+    out[k] = k === "pattern" && typeof v === "string" ? stripLookaroundFromPattern(v) : stripPatternsNested(v);
+  }
+  return out;
+}
+
+function stripPatternsNested(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((e) => stripPatternsNested(e));
+  if (isJsonObject(value)) return stripLookaroundPatterns(value as JsonSchema);
+  return value;
+}
+
 
 /** `Api` values with no documented structured-output wire field (agentic/terminal transports, plus the SDK's own `mock` provider). */
 const UNSUPPORTED_APIS = ["cursor-agent", "gitlab-duo-agent", "devin-agent", "mock"] as const;
@@ -145,7 +260,7 @@ function injectOpenAICompletionsResponseFormat(payload: Record<string, unknown>,
     ...payload,
     response_format: {
       type: "json_schema",
-      json_schema: { name: RESPONSE_FORMAT_NAME, schema: stripFormatKeywords(schema), strict: true },
+      json_schema: { name: RESPONSE_FORMAT_NAME, schema: stripLookaroundPatterns(stripFormatKeywords(schema)), strict: true },
     },
   };
 }
