@@ -100,7 +100,7 @@ large_continuations=0
 for i in $(seq 1 $large_total); do
   echo "--- run $i/$large_total ---"
   start=$(date +%s)
-  out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$LARGE_SCHEMA" --prompt "$LARGE_PROMPT" --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-a-$i.err)
+  out=$("$CLI" --model vllm/qwen3.8-27b-ablit --json-schema "$LARGE_SCHEMA" --prompt "$LARGE_PROMPT" --reasoning off --cwd "$SCRATCH_CWD" 2>/tmp/omp-structured-a-$i.err)
   code=$?
   elapsed=$(( $(date +%s) - start ))
   needed_continuation=$(grep -c "one-shot session read" /tmp/omp-structured-a-$i.err || true)
