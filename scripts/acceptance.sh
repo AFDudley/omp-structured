@@ -27,7 +27,18 @@
 #       reachability outside this repo.
 set -uo pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")/.."
+cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null || true
+if [ ! -e dist/cli.js ]; then
+  # BASH_SOURCE lost its directory component (wrapped invocation, e.g. `bash -c 'bash
+  # scripts/acceptance.sh'` sets BASH_SOURCE="bash" so dirname = "."), and the plain cd
+  # landed in the parent of the repo root. Re-derive the script's own location from disk:
+  # the script lives at <repo>/scripts/acceptance.sh, so the repo root is one level above
+  # its directory.
+  SELF="$(find . -maxdepth 3 -name acceptance.sh 2>/dev/null | head -1)"
+  if [ -n "$SELF" ]; then
+    cd "$(dirname "$SELF")/.."
+  fi
+fi
 
 chmod +x dist/cli.js 2>/dev/null || true
 CLI="./dist/cli.js"
